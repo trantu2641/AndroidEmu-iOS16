@@ -1,0 +1,16 @@
+.DS_Store
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+Kernarium/*
+!Kernarium/.gitkeep
+
+App/AndroidEmu.xcodeproj/xcuserdata/
+
+ROM/
+*.img
+*.qcow2
+*.raw
+*.zip
