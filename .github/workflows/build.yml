@@ -1,0 +1,77 @@
+name: AndroidEmu iOS 16.4
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IOS_VERSION: "16.4"
+  KERNARIUM_COMMIT: "2c49df8ccb7b138400548ccc391511c5642eca57"
+
+jobs:
+
+  build:
+
+    runs-on: macos-15
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          xcodebuild -version
+
+      - name: Install dependencies
+        run: |
+          brew install cmake ninja ccache python3
+
+      - name: Fetch Kernarium
+        run: |
+          chmod +x scripts/fetch-kernarium.sh
+          ./scripts/fetch-kernarium.sh
+
+      - name: Patch iOS 16.4
+        run: |
+          chmod +x scripts/patch-ios16.sh
+          ./scripts/patch-ios16.sh Kernarium
+
+      - name: Build Kernarium
+        run: |
+          chmod +x scripts/build-kernarium.sh
+          ./scripts/build-kernarium.sh
+
+      - name: Stage Android
+        run: |
+          chmod +x scripts/stage-android.sh
+          ./scripts/stage-android.sh
+
+      - name: Build iOS application
+        run: |
+
+          xcodebuild \
+            -project App/AndroidEmu.xcodeproj \
+            -scheme AndroidEmu \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            IPHONEOS_DEPLOYMENT_TARGET=16.4 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package IPA
+        run: |
+          chmod +x scripts/package-ipa.sh
+          ./scripts/package-ipa.sh
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+
+        with:
+          name: AndroidEmu-iOS16.4
+          path: AndroidEmu-iOS16.4.ipa
