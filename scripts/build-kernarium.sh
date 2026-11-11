@@ -84,10 +84,26 @@ cd "$KERNARIUM"
 
 DEPENDENCY_ROOT="$KERNARIUM/external/sources"
 
-echo "Preparing dependency source trees:"
+echo "Dependency source root:"
 echo "$DEPENDENCY_ROOT"
 
+# IMPORTANT:
+# prepare.sh yêu cầu mỗi dependency là một Git repository hoàn chỉnh.
+# Nếu workflow trước đó bị fail giữa chừng, source tree có thể tồn tại
+# nhưng không còn ở trạng thái hợp lệ.
+#
+# Xóa sạch source tree để tránh:
+#   "utm-webkit is not a prepared Git repository"
+#
+rm -rf "$DEPENDENCY_ROOT"
+
 mkdir -p "$DEPENDENCY_ROOT"
+
+echo
+echo "Clean dependency source tree created."
+
+echo
+echo "Running dependencies/prepare.sh..."
 
 "$KERNARIUM/dependencies/prepare.sh" \
     --product apple-gpu \
@@ -100,12 +116,37 @@ fi
 
 echo
 echo "Prepared dependency sources:"
+
 find "$DEPENDENCY_ROOT" \
     -mindepth 1 \
     -maxdepth 1 \
     -type d \
     -print \
     | sort
+
+# Verify each expected dependency is actually a Git repository.
+for repo in \
+    "$DEPENDENCY_ROOT/utm-webkit" \
+    "$DEPENDENCY_ROOT/utm-libepoxy" \
+    "$DEPENDENCY_ROOT/utm-virglrenderer"
+do
+    if [ ! -d "$repo/.git" ]; then
+        fail "Dependency is not a valid Git repository: $repo"
+    fi
+done
+
+echo
+echo "All dependency repositories are valid Git repositories."
+
+section "Clean previous dependency builds"
+
+rm -rf \
+    "$KERNARIUM/.build/dependency-build" \
+    "$KERNARIUM/.build/dependencies"
+
+mkdir -p "$KERNARIUM/.build/dependencies"
+
+echo "Previous dependency build directories removed."
 
 section "Build host macOS dependency"
 
@@ -128,15 +169,14 @@ echo "  prefix   : $MACOS_GPU_PREFIX"
     --prefix "$MACOS_GPU_PREFIX" \
     --jobs "$CPU_COUNT"
 
-section "Verify host macOS dependency"
-
 if [ ! -d "$MACOS_GPU_PREFIX" ]; then
-    fail "Missing macOS dependency prefix: $MACOS_GPU_PREFIX"
+    fail "macOS dependency prefix was not created: $MACOS_GPU_PREFIX"
 fi
+
+section "Verify host macOS dependency"
 
 echo "OK: $MACOS_GPU_PREFIX"
 
-echo
 find "$MACOS_GPU_PREFIX" \
     -type f \
     \( -name "*.a" -o -name "*.dylib" \) \
@@ -174,44 +214,37 @@ fi
 echo "OK: $EPOXY"
 echo "OK: $VIRGL"
 
-section "Verify dependency prefixes"
+section "Prepare Kernarium dependency layout"
 
-echo "Host:"
-echo "  $MACOS_GPU_PREFIX"
+EXPECTED_MACOS_PREFIX="$KERNARIUM/.build/dependencies/macos-arm64"
 
-echo
-echo "iOS:"
-echo "  $IOS_GPU_PREFIX"
+if [ ! -d "$EXPECTED_MACOS_PREFIX" ]; then
+    echo "Creating Kernarium compatibility path:"
+    echo "  $EXPECTED_MACOS_PREFIX"
 
-if [ ! -d "$KERNARIUM/.build/dependencies/macos-arm64" ]; then
-    echo
-    echo "WARNING:"
-    echo "Kernarium expects:"
-    echo "  $KERNARIUM/.build/dependencies/macos-arm64"
-    echo
-    echo "Creating compatibility link..."
-
-    mkdir -p "$KERNARIUM/.build/dependencies"
-
-    rm -rf "$KERNARIUM/.build/dependencies/macos-arm64"
+    mkdir -p "$(dirname "$EXPECTED_MACOS_PREFIX")"
 
     ln -s \
         "$MACOS_GPU_PREFIX" \
-        "$KERNARIUM/.build/dependencies/macos-arm64"
+        "$EXPECTED_MACOS_PREFIX"
 fi
 
-if [ ! -d "$KERNARIUM/.build/dependencies/macos-arm64" ]; then
-    fail "macos-arm64 dependency prefix is still missing."
+if [ ! -d "$EXPECTED_MACOS_PREFIX" ]; then
+    fail "Kernarium macos-arm64 dependency prefix is missing."
 fi
 
-if [ ! -d "$KERNARIUM/.build/dependencies/apple-gpu/ios-device-arm64" ]; then
-    fail "ios-device-arm64 dependency prefix is missing."
+if [ ! -d "$IOS_GPU_PREFIX" ]; then
+    fail "Kernarium ios-device-arm64 dependency prefix is missing."
 fi
 
 echo
-echo "Dependency prefixes available:"
-echo "  macos-arm64       -> $(readlink "$KERNARIUM/.build/dependencies/macos-arm64" || echo "$KERNARIUM/.build/dependencies/macos-arm64")"
-echo "  ios-device-arm64  -> $IOS_GPU_PREFIX"
+echo "Dependency layout ready:"
+echo
+echo "  macos-arm64:"
+echo "    $EXPECTED_MACOS_PREFIX"
+echo
+echo "  ios-device-arm64:"
+echo "    $IOS_GPU_PREFIX"
 
 section "Configure Kernarium"
 
@@ -241,6 +274,7 @@ section "Build output"
 
 echo "Build directory:"
 echo "$BUILD_DIR"
+
 echo
 
 find "$BUILD_DIR" \
