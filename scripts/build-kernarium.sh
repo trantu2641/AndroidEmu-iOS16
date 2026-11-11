@@ -61,14 +61,13 @@ log "Configure Git identity"
 git config --global user.name "AndroidEmu Builder"
 git config --global user.email "androidemu-builder@localhost"
 
-echo "Git global user : $(git config --global user.name)"
-echo "Git global email: $(git config --global user.email)"
-
 export GIT_AUTHOR_NAME="AndroidEmu Builder"
 export GIT_AUTHOR_EMAIL="androidemu-builder@localhost"
 export GIT_COMMITTER_NAME="AndroidEmu Builder"
 export GIT_COMMITTER_EMAIL="androidemu-builder@localhost"
 
+echo "Git global user : $(git config --global user.name)"
+echo "Git global email: $(git config --global user.email)"
 echo "Committer       : ${GIT_COMMITTER_NAME} <${GIT_COMMITTER_EMAIL}>"
 
 # ==========================================================
@@ -90,6 +89,8 @@ required_tools=(
     glibtoolize
     autopoint
     gperf
+    groff
+    git
 )
 
 for tool in "${required_tools[@]}"; do
@@ -111,6 +112,8 @@ echo "automake   : $(automake --version | head -1)"
 echo "libtool    : $(glibtoolize --version | head -1)"
 echo "autopoint  : $(autopoint --version | head -1)"
 echo "gperf      : $(gperf --version | head -1)"
+echo "groff      : $(groff --version | head -1)"
+echo "git        : $(git --version)"
 
 # ==========================================================
 # Python environment
@@ -118,7 +121,7 @@ echo "gperf      : $(gperf --version | head -1)"
 
 log "Verify Python build environment"
 
-VENV="$RUNNER_TEMP/kernarium-venv"
+VENV="${RUNNER_TEMP:-$ROOT/.build}/kernarium-venv"
 
 if [ ! -d "$VENV" ]; then
     echo
@@ -169,7 +172,7 @@ else
 fi
 
 # ==========================================================
-# Prepare dependency sources
+# Prepare dependency source root
 # ==========================================================
 
 log "Prepare Kernarium dependency sources"
@@ -179,24 +182,187 @@ mkdir -p "$SOURCE_ROOT"
 echo "Dependency source root:"
 echo "$SOURCE_ROOT"
 
-# ----------------------------------------------------------
-# IMPORTANT:
+# ==========================================================
+# Savannah / libiconv recovery
 #
-# Kernarium has separate dependency products.
+# Kernarium pins libiconv to:
 #
-# macos     = host/runtime dependencies
-# apple-gpu = Apple GPU dependencies
+#   ed5a57cfedda75a6abbe4d0fb89a6f7b832f073e
 #
-# build.sh internally verifies product=macos, therefore
-# macos MUST be prepared before calling build.sh.
-# ----------------------------------------------------------
+# Official URL:
+#
+#   https://git.savannah.gnu.org/git/libiconv.git
+#
+# Savannah occasionally returns HTTP 500 from Git fetch.
+#
+# We DO NOT change the pinned commit.
+#
+# If the official repository fails, try a known public mirror.
+# The mirror is accepted only if it contains the EXACT pinned
+# commit. Otherwise the normal official fetch is allowed to
+# fail rather than silently using another revision.
+# ==========================================================
+
+prepare_libiconv_fallback()
+{
+    local libiconv_dir="$SOURCE_ROOT/libiconv"
+    local cache_root="$KERNARIUM/.build/dependency-cache/git"
+    local cache_repo="$cache_root/libiconv"
+    local pinned_commit="ed5a57cfedda75a6abbe4d0fb89a6f7b832f073e"
+
+    local mirrors=(
+        "https://github.com/Distrotech/libiconv.git"
+        "https://github.com/jwinarske/libiconv.git"
+        "https://github.com/gnu-mirror-unofficial/libiconv.git"
+    )
+
+    echo
+    echo "=========================================================="
+    echo "libiconv Savannah recovery"
+    echo "=========================================================="
+    echo "Pinned commit:"
+    echo "$pinned_commit"
+
+    mkdir -p "$cache_root"
+
+    # ------------------------------------------------------
+    # If a prepared repository already exists, do not touch it.
+    # ------------------------------------------------------
+
+    if [ -d "$libiconv_dir/.git" ]; then
+        if git -C "$libiconv_dir" rev-parse \
+            "$pinned_commit^{commit}" >/dev/null 2>&1; then
+
+            echo
+            echo "Existing libiconv repository already contains:"
+            echo "$pinned_commit"
+
+            return 0
+        fi
+    fi
+
+    # ------------------------------------------------------
+    # Try mirrors one by one.
+    # ------------------------------------------------------
+
+    local mirror
+
+    for mirror in "${mirrors[@]}"; do
+        echo
+        echo "Trying libiconv mirror:"
+        echo "$mirror"
+
+        rm -rf "$cache_repo"
+
+        mkdir -p "$cache_root"
+
+        if git clone \
+            --filter=blob:none \
+            --no-checkout \
+            --depth 1 \
+            "$mirror" \
+            "$cache_repo" >/dev/null 2>&1; then
+
+            if git -C "$cache_repo" fetch \
+                --no-tags \
+                --depth 1 \
+                origin \
+                "$pinned_commit" >/dev/null 2>&1; then
+
+                if git -C "$cache_repo" rev-parse \
+                    "$pinned_commit^{commit}" >/dev/null 2>&1; then
+
+                    echo
+                    echo "SUCCESS:"
+                    echo "Mirror contains the exact pinned libiconv commit."
+
+                    echo
+                    echo "Mirror:"
+                    echo "$mirror"
+
+                    echo
+                    echo "Pinned commit:"
+                    git -C "$cache_repo" rev-parse \
+                        "$pinned_commit^{commit}"
+
+                    # --------------------------------------------------
+                    # IMPORTANT:
+                    #
+                    # prepare.sh requires its repository metadata to
+                    # match the manifest repository URL. Therefore we
+                    # cannot simply rename this mirror as libiconv.
+                    #
+                    # Instead, export the exact commit into a local
+                    # bundle/cache that Git can use without network.
+                    # --------------------------------------------------
+
+                    local bundle="$cache_root/libiconv-$pinned_commit.bundle"
+
+                    rm -f "$bundle"
+
+                    git -C "$cache_repo" bundle create \
+                        "$bundle" \
+                        "$pinned_commit" >/dev/null
+
+                    echo
+                    echo "Created verified libiconv bundle:"
+                    echo "$bundle"
+
+                    export KERNARIUM_LIBICONV_BUNDLE="$bundle"
+
+                    return 0
+                fi
+            fi
+        fi
+
+        echo "Mirror does not provide the required pinned commit."
+    done
+
+    echo
+    echo "No mirror currently contains the exact pinned libiconv commit."
+    return 1
+}
+
+# ==========================================================
+# Prepare macOS host dependency repositories
+# ==========================================================
 
 echo
 echo "Preparing macOS host dependency repositories..."
 
-run "$KERNARIUM/dependencies/prepare.sh" \
+if ! "$KERNARIUM/dependencies/prepare.sh" \
     --product macos \
-    --root "$SOURCE_ROOT"
+    --root "$SOURCE_ROOT"; then
+
+    echo
+    echo "WARNING: macOS dependency preparation failed."
+    echo "Attempting libiconv recovery..."
+
+    if ! prepare_libiconv_fallback; then
+        fail "Kernarium dependency preparation failed and no verified libiconv mirror contains the pinned commit."
+    fi
+
+    # ------------------------------------------------------
+    # At this point the mirror bundle has been verified.
+    #
+    # prepare.sh itself still requires the manifest URL.
+    # Retry official preparation after the recovery attempt.
+    #
+    # This gives Savannah another chance in case the HTTP 500
+    # was temporary.
+    # ------------------------------------------------------
+
+    echo
+    echo "Retrying official macOS dependency preparation..."
+
+    "$KERNARIUM/dependencies/prepare.sh" \
+        --product macos \
+        --root "$SOURCE_ROOT"
+fi
+
+# ==========================================================
+# Prepare Apple GPU dependency repositories
+# ==========================================================
 
 echo
 echo "Preparing Apple GPU dependency repositories..."
@@ -303,7 +469,7 @@ fi
 IOS_EPOXY="$IOS_GPU_PREFIX/lib/libepoxy.a"
 IOS_VIRGL="$IOS_GPU_PREFIX/lib/libvirglrenderer.a"
 
-if [ !f "$IOS_EPOXY" ]; then
+if [ ! -f "$IOS_EPOXY" ]; then
     fail "Missing iOS libepoxy.a: $IOS_EPOXY"
 fi
 
