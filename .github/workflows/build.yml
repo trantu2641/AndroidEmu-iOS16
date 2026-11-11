@@ -15,14 +15,15 @@ jobs:
     runs-on: macos-15
 
     steps:
+
       # ==========================================================
-      # Checkout
+      # 1. Checkout
       # ==========================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # ==========================================================
-      # Select Xcode 16.4
+      # 2. Select Xcode 16.4
       # ==========================================================
       - name: Select Xcode 16.4
         run: |
@@ -30,15 +31,19 @@ jobs:
 
           sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
 
-          echo "Xcode:"
-          xcodebuild -version || true
+          echo "========================================"
+          echo "Xcode"
+          echo "========================================"
+          xcodebuild -version
 
           echo
-          echo "SDK:"
+          echo "========================================"
+          echo "iOS SDK"
+          echo "========================================"
           xcrun --sdk iphoneos --show-sdk-path
 
       # ==========================================================
-      # Install all Kernarium build dependencies
+      # 3. Install build dependencies
       # ==========================================================
       - name: Install build dependencies
         run: |
@@ -58,11 +63,15 @@ jobs:
             libtool \
             gettext \
             gperf \
-            groff
+            groff \
+            curl \
+            wget \
+            rsync
 
           echo
-          echo "Installed tools:"
-          echo
+          echo "========================================"
+          echo "Build tools"
+          echo "========================================"
 
           cmake --version
           ninja --version
@@ -72,37 +81,61 @@ jobs:
           clang --version
 
           echo
-          echo "Autotools:"
+          echo "========================================"
+          echo "Autotools"
+          echo "========================================"
+
           autoreconf --version
           autoconf --version
           automake --version
 
           echo
-          echo "Libtool:"
+          echo "========================================"
+          echo "Libtool"
+          echo "========================================"
+
           glibtoolize --version || libtoolize --version
 
           echo
-          echo "gettext:"
+          echo "========================================"
+          echo "gettext"
+          echo "========================================"
+
           autopoint --version
 
           echo
-          echo "gperf:"
+          echo "========================================"
+          echo "gperf"
+          echo "========================================"
+
           gperf --version
 
           echo
-          echo "groff:"
+          echo "========================================"
+          echo "groff"
+          echo "========================================"
+
           groff --version
 
+          echo
+          echo "========================================"
+          echo "curl"
+          echo "========================================"
+
+          curl --version | head -1
+
       # ==========================================================
-      # Python environment
+      # 4. Python virtual environment
       # ==========================================================
       - name: Prepare Python build environment
         run: |
           set -euo pipefail
 
-          python3 -m venv "$RUNNER_TEMP/kernarium-venv"
+          VENV="$RUNNER_TEMP/kernarium-venv"
 
-          source "$RUNNER_TEMP/kernarium-venv/bin/activate"
+          python3 -m venv "$VENV"
+
+          source "$VENV/bin/activate"
 
           python -m pip install --upgrade pip
           python -m pip install PyYAML
@@ -116,8 +149,7 @@ jobs:
           python -c "import yaml; print(yaml.__version__)"
 
       # ==========================================================
-      # Configure Git identity
-      # Kernarium dependency preparation requires Git identity.
+      # 5. Configure Git
       # ==========================================================
       - name: Configure Git identity
         run: |
@@ -126,12 +158,18 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          export GIT_AUTHOR_NAME="github-actions[bot]"
+          export GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+          export GIT_COMMITTER_NAME="github-actions[bot]"
+          export GIT_COMMITTER_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo
           echo "Git identity:"
           git config --global user.name
           git config --global user.email
 
       # ==========================================================
-      # Fetch Kernarium
+      # 6. Fetch Kernarium
       # ==========================================================
       - name: Fetch Kernarium
         run: |
@@ -140,12 +178,28 @@ jobs:
           chmod +x scripts/fetch-kernarium.sh
           scripts/fetch-kernarium.sh
 
+          KERNARIUM="$GITHUB_WORKSPACE/Kernarium"
+
           echo
-          echo "Kernarium commit:"
-          git -C "$GITHUB_WORKSPACE/Kernarium" rev-parse HEAD
+          echo "========================================"
+          echo "Kernarium commit"
+          echo "========================================"
+
+          git -C "$KERNARIUM" rev-parse HEAD
+
+          ACTUAL="$(git -C "$KERNARIUM" rev-parse HEAD)"
+          EXPECTED="${KERNARIUM_COMMIT}"
+
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo
+            echo "ERROR: Kernarium commit mismatch"
+            echo "Expected: $EXPECTED"
+            echo "Actual  : $ACTUAL"
+            exit 1
+          fi
 
       # ==========================================================
-      # Verify AOSP 17 source
+      # 7. Verify AOSP 17
       # ==========================================================
       - name: Verify Kernarium Android source
         run: |
@@ -154,54 +208,151 @@ jobs:
           KERNARIUM="$GITHUB_WORKSPACE/Kernarium"
 
           if [ ! -d "$KERNARIUM/android/aosp-17" ]; then
-            echo "ERROR: Kernarium Android AOSP 17 source not found:"
+            echo "ERROR: Android AOSP 17 source not found:"
             echo "$KERNARIUM/android/aosp-17"
             exit 1
           fi
 
-          echo "AOSP 17 source:"
+          echo
+          echo "========================================"
+          echo "AOSP 17"
+          echo "========================================"
+
           du -sh "$KERNARIUM/android/aosp-17"
 
           echo
-          echo "AOSP 17 contents:"
-          find "$KERNARIUM/android/aosp-17" -maxdepth 1 -mindepth 1 -print | sort
+          find "$KERNARIUM/android/aosp-17" \
+            -maxdepth 1 \
+            -mindepth 1 \
+            -print \
+            | sort
 
       # ==========================================================
-      # Patch Kernarium for iOS 16.4
+      # 8. Patch Kernarium
       # ==========================================================
       - name: Patch Kernarium for iOS 16.4
         run: |
           set -euo pipefail
 
           chmod +x scripts/patch-ios16.sh
-          scripts/patch-ios16.sh "$GITHUB_WORKSPACE/Kernarium"
+
+          scripts/patch-ios16.sh \
+            "$GITHUB_WORKSPACE/Kernarium"
 
       # ==========================================================
-      # Build Kernarium
+      # 9. Prepare network/download environment
+      #
+      # This does NOT replace Kernarium's dependency system.
+      # It only gives Git a more reliable transport configuration
+      # before prepare.sh starts downloading dependencies.
+      # ==========================================================
+      - name: Prepare dependency download environment
+        run: |
+          set -euo pipefail
+
+          echo
+          echo "========================================"
+          echo "Configure Git transport"
+          echo "========================================"
+
+          git config --global http.version HTTP/1.1
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 60
+          git config --global fetch.prune true
+          git config --global advice.detachedHead false
+
+          echo
+          echo "Git HTTP version:"
+          git config --global http.version
+
+          echo
+          echo "Git low speed limit:"
+          git config --global http.lowSpeedLimit
+
+          echo
+          echo "Git low speed time:"
+          git config --global http.lowSpeedTime
+
+      # ==========================================================
+      # 10. Build Kernarium
+      #
+      # The actual dependency preparation/build remains inside
+      # scripts/build-kernarium.sh.
       # ==========================================================
       - name: Build Kernarium
+        env:
+          IOS_VERSION: "16.4"
+          KERNARIUM_COMMIT: "2c49df8ccb7b138400548ccc391511c5642eca57"
         run: |
           set -euo pipefail
 
           chmod +x scripts/build-kernarium.sh
 
-          export IOS_VERSION="16.4"
-          export KERNARIUM_COMMIT="2c49df8ccb7b138400548ccc391511c5642eca57"
+          echo
+          echo "========================================"
+          echo "Build Kernarium"
+          echo "========================================"
 
           scripts/build-kernarium.sh
 
       # ==========================================================
-      # Stage Android runtime
+      # 11. Verify Kernarium output
+      # ==========================================================
+      - name: Verify Kernarium build output
+        run: |
+          set -euo pipefail
+
+          KERNARIUM="$GITHUB_WORKSPACE/Kernarium"
+
+          echo
+          echo "========================================"
+          echo "Kernarium build output"
+          echo "========================================"
+
+          BUILD_DIR="$KERNARIUM/.build/ios-arm64"
+          INSTALL_DIR="$KERNARIUM/.build/install-ios"
+
+          if [ ! -d "$BUILD_DIR" ]; then
+            echo "ERROR: Kernarium build directory missing:"
+            echo "$BUILD_DIR"
+            exit 1
+          fi
+
+          if [ ! -d "$INSTALL_DIR" ]; then
+            echo "ERROR: Kernarium install directory missing:"
+            echo "$INSTALL_DIR"
+            exit 1
+          fi
+
+          echo
+          echo "Build directory:"
+          du -sh "$BUILD_DIR"
+
+          echo
+          echo "Install directory:"
+          du -sh "$INSTALL_DIR"
+
+          echo
+          echo "Installed files:"
+          find "$INSTALL_DIR" \
+            -type f \
+            -print \
+            | sort \
+            | head -300
+
+      # ==========================================================
+      # 12. Stage Android runtime
       # ==========================================================
       - name: Stage Android runtime
         run: |
           set -euo pipefail
 
           chmod +x scripts/stage-android.sh
+
           scripts/stage-android.sh
 
       # ==========================================================
-      # Verify staged Android runtime
+      # 13. Verify Android runtime
       # ==========================================================
       - name: Verify staged Android runtime
         run: |
@@ -209,23 +360,38 @@ jobs:
 
           APP_ANDROID="$GITHUB_WORKSPACE/App/AndroidEmu/Resources/Android"
 
+          echo
+          echo "========================================"
+          echo "Android runtime"
+          echo "========================================"
+
           if [ ! -d "$APP_ANDROID" ]; then
             echo "ERROR: Android runtime directory does not exist:"
             echo "$APP_ANDROID"
             exit 1
           fi
 
-          echo "Android runtime directory:"
+          echo
+          echo "Runtime directory:"
           echo "$APP_ANDROID"
 
           echo
-          echo "Contents:"
-          find "$APP_ANDROID" -maxdepth 3 -type f -print | sort | head -200
+          echo "Runtime size:"
+          du -sh "$APP_ANDROID"
+
+          echo
+          echo "Runtime files:"
+          find "$APP_ANDROID" \
+            -maxdepth 5 \
+            -type f \
+            -print \
+            | sort \
+            | head -500
 
       # ==========================================================
-      # Build iOS application
+      # 14. Verify Xcode project
       # ==========================================================
-      - name: Build AndroidEmu.app
+      - name: Verify Xcode project
         run: |
           set -euo pipefail
 
@@ -238,15 +404,48 @@ jobs:
             exit 1
           fi
 
-          source "$RUNNER_TEMP/kernarium-venv/bin/activate"
+          echo
+          echo "========================================"
+          echo "Xcode project"
+          echo "========================================"
+
+          echo "Project:"
+          echo "$PROJECT"
+
+          echo
+          echo "Schemes:"
+
+          xcodebuild \
+            -project "$PROJECT" \
+            -list
+
+      # ==========================================================
+      # 15. Build AndroidEmu.app
+      # ==========================================================
+      - name: Build AndroidEmu.app
+        run: |
+          set -euo pipefail
+
+          APP_DIR="$GITHUB_WORKSPACE/App"
+          PROJECT="$APP_DIR/AndroidEmu.xcodeproj"
 
           SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
 
           echo
-          echo "Using:"
-          echo "  Project: $PROJECT"
-          echo "  SDK: $SDK_PATH"
-          echo "  Deployment target: 16.4"
+          echo "========================================"
+          echo "Build AndroidEmu.app"
+          echo "========================================"
+
+          echo "Project:"
+          echo "$PROJECT"
+
+          echo
+          echo "SDK:"
+          echo "$SDK_PATH"
+
+          echo
+          echo "Deployment target:"
+          echo "16.4"
 
           xcodebuild \
             -project "$PROJECT" \
@@ -260,11 +459,16 @@ jobs:
             clean build
 
       # ==========================================================
-      # Verify AndroidEmu.app
+      # 16. Locate AndroidEmu.app
       # ==========================================================
       - name: Verify AndroidEmu.app
         run: |
           set -euo pipefail
+
+          echo
+          echo "========================================"
+          echo "Locate AndroidEmu.app"
+          echo "========================================"
 
           APP="$(find "$HOME/Library/Developer/Xcode/DerivedData" \
             -type d \
@@ -273,7 +477,16 @@ jobs:
             -quit)"
 
           if [ -z "$APP" ]; then
+            echo
             echo "ERROR: AndroidEmu.app was not produced."
+            echo
+            echo "Searching all .app bundles:"
+            find "$HOME/Library/Developer/Xcode/DerivedData" \
+              -type d \
+              -name "*.app" \
+              -print \
+              | head -100
+
             exit 1
           fi
 
@@ -287,26 +500,45 @@ jobs:
 
           echo
           echo "App contents:"
-          find "$APP" -maxdepth 2 -type f -print | sort | head -200
+          find "$APP" \
+            -maxdepth 3 \
+            -type f \
+            -print \
+            | sort \
+            | head -500
+
+          echo
+          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
 
       # ==========================================================
-      # Package IPA
+      # 17. Package IPA
       # ==========================================================
       - name: Package IPA
         run: |
           set -euo pipefail
 
           chmod +x scripts/package-ipa.sh
+
+          echo
+          echo "========================================"
+          echo "Package IPA"
+          echo "========================================"
+
           scripts/package-ipa.sh
 
       # ==========================================================
-      # Verify IPA
+      # 18. Verify IPA
       # ==========================================================
       - name: Verify IPA
         run: |
           set -euo pipefail
 
           IPA="$GITHUB_WORKSPACE/AndroidEmu-iOS16.4.ipa"
+
+          echo
+          echo "========================================"
+          echo "Verify IPA"
+          echo "========================================"
 
           if [ ! -f "$IPA" ]; then
             echo "ERROR: IPA was not created:"
@@ -320,10 +552,14 @@ jobs:
 
           echo
           echo "IPA contents:"
-          unzip -l "$IPA" | head -100
+          unzip -l "$IPA" | head -200
+
+          echo
+          echo "IPA validation:"
+          unzip -t "$IPA"
 
       # ==========================================================
-      # Upload IPA
+      # 19. Upload IPA
       # ==========================================================
       - name: Upload IPA
         uses: actions/upload-artifact@v4
