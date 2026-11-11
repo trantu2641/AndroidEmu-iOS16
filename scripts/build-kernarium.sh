@@ -6,7 +6,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KERNARIUM="$ROOT/Kernarium"
 
 BUILD_DIR="$KERNARIUM/.build/kernarium-ios16"
-GPU_PREFIX="$KERNARIUM/.build/dependencies/apple-gpu/ios-device-arm64"
+
+IOS_GPU_PREFIX="$KERNARIUM/.build/dependencies/apple-gpu/ios-device-arm64"
+MACOS_GPU_PREFIX="$KERNARIUM/.build/dependencies/apple-gpu/macos-arm64"
 
 IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 IOS_CC="$(xcrun --sdk iphoneos -f clang)"
@@ -41,7 +43,7 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 if [ "$(uname -m)" != "arm64" ]; then
-    fail "Kernarium Apple GPU build requires an arm64 macOS runner."
+    fail "Kernarium build requires an arm64 macOS runner."
 fi
 
 command -v xcodebuild >/dev/null 2>&1 ||
@@ -53,25 +55,20 @@ command -v xcrun >/dev/null 2>&1 ||
 command -v cmake >/dev/null 2>&1 ||
     fail "cmake not found."
 
-echo "macOS      : $(sw_vers -productVersion)"
-echo "Xcode      : $(xcodebuild -version | head -1)"
-echo "iOS SDK    : $IOS_SDK"
-echo "CPU cores  : $CPU_COUNT"
-echo "Kernarium  : $KERNARIUM"
+command -v meson >/dev/null 2>&1 ||
+    fail "meson not found."
+
+echo "macOS       : $(sw_vers -productVersion)"
+echo "Xcode       : $(xcodebuild -version | head -1)"
+echo "iOS SDK     : $IOS_SDK"
+echo "CPU cores   : $CPU_COUNT"
+echo "Kernarium   : $KERNARIUM"
 
 section "Configure Git identity"
-
-#
-# dependencies/prepare.sh checks the GLOBAL Git identity.
-# Local repository config is not enough.
-#
 
 git config --global user.name "AndroidEmu Builder"
 git config --global user.email "androidemu-builder@localhost"
 
-# Also provide the identity through environment variables.
-# This makes the build independent of which Git config scope
-# prepare.sh happens to inspect.
 export GIT_AUTHOR_NAME="AndroidEmu Builder"
 export GIT_AUTHOR_EMAIL="androidemu-builder@localhost"
 export GIT_COMMITTER_NAME="AndroidEmu Builder"
@@ -92,16 +89,10 @@ echo "$DEPENDENCY_ROOT"
 
 mkdir -p "$DEPENDENCY_ROOT"
 
-#
-# IMPORTANT:
-#
-# build-apple-gpu.sh itself calls prepare.sh with --verify.
-# Therefore prepare.sh must run once WITHOUT --verify first.
-#
-
 "$KERNARIUM/dependencies/prepare.sh" \
     --product apple-gpu \
-    --root "$DEPENDENCY_ROOT"
+    --root "$DEPENDENCY_ROOT" \
+    --verify
 
 if [ ! -d "$DEPENDENCY_ROOT" ]; then
     fail "Dependency source root was not created."
@@ -116,7 +107,7 @@ find "$DEPENDENCY_ROOT" \
     -print \
     | sort
 
-section "Build Apple GPU dependency"
+section "Build host macOS dependency"
 
 GPU_SCRIPT="$KERNARIUM/dependencies/build-apple-gpu.sh"
 
@@ -124,23 +115,53 @@ if [ ! -f "$GPU_SCRIPT" ]; then
     fail "Apple GPU build script not found: $GPU_SCRIPT"
 fi
 
+echo "Building host dependency:"
+echo "  platform : macos"
+echo "  product  : apple-gpu"
+echo "  jobs     : $CPU_COUNT"
+echo "  prefix   : $MACOS_GPU_PREFIX"
+
+"$GPU_SCRIPT" \
+    --platform macos \
+    --product apple-gpu \
+    --source-root "$DEPENDENCY_ROOT" \
+    --prefix "$MACOS_GPU_PREFIX" \
+    --jobs "$CPU_COUNT"
+
+section "Verify host macOS dependency"
+
+if [ ! -d "$MACOS_GPU_PREFIX" ]; then
+    fail "Missing macOS dependency prefix: $MACOS_GPU_PREFIX"
+fi
+
+echo "OK: $MACOS_GPU_PREFIX"
+
+echo
+find "$MACOS_GPU_PREFIX" \
+    -type f \
+    \( -name "*.a" -o -name "*.dylib" \) \
+    -print \
+    | sort
+
+section "Build iOS Apple GPU dependency"
+
 echo "Building:"
 echo "  platform : ios"
 echo "  product  : apple-gpu"
 echo "  jobs     : $CPU_COUNT"
-echo "  prefix   : $GPU_PREFIX"
+echo "  prefix   : $IOS_GPU_PREFIX"
 
 "$GPU_SCRIPT" \
     --platform ios \
     --product apple-gpu \
     --source-root "$DEPENDENCY_ROOT" \
-    --prefix "$GPU_PREFIX" \
+    --prefix "$IOS_GPU_PREFIX" \
     --jobs "$CPU_COUNT"
 
-section "Verify Apple GPU dependency"
+section "Verify iOS Apple GPU dependency"
 
-EPOXY="$GPU_PREFIX/lib/libepoxy.a"
-VIRGL="$GPU_PREFIX/lib/libvirglrenderer.a"
+EPOXY="$IOS_GPU_PREFIX/lib/libepoxy.a"
+VIRGL="$IOS_GPU_PREFIX/lib/libvirglrenderer.a"
 
 if [ ! -f "$EPOXY" ]; then
     fail "Missing libepoxy.a: $EPOXY"
@@ -152,6 +173,45 @@ fi
 
 echo "OK: $EPOXY"
 echo "OK: $VIRGL"
+
+section "Verify dependency prefixes"
+
+echo "Host:"
+echo "  $MACOS_GPU_PREFIX"
+
+echo
+echo "iOS:"
+echo "  $IOS_GPU_PREFIX"
+
+if [ ! -d "$KERNARIUM/.build/dependencies/macos-arm64" ]; then
+    echo
+    echo "WARNING:"
+    echo "Kernarium expects:"
+    echo "  $KERNARIUM/.build/dependencies/macos-arm64"
+    echo
+    echo "Creating compatibility link..."
+
+    mkdir -p "$KERNARIUM/.build/dependencies"
+
+    rm -rf "$KERNARIUM/.build/dependencies/macos-arm64"
+
+    ln -s \
+        "$MACOS_GPU_PREFIX" \
+        "$KERNARIUM/.build/dependencies/macos-arm64"
+fi
+
+if [ ! -d "$KERNARIUM/.build/dependencies/macos-arm64" ]; then
+    fail "macos-arm64 dependency prefix is still missing."
+fi
+
+if [ ! -d "$KERNARIUM/.build/dependencies/apple-gpu/ios-device-arm64" ]; then
+    fail "ios-device-arm64 dependency prefix is missing."
+fi
+
+echo
+echo "Dependency prefixes available:"
+echo "  macos-arm64       -> $(readlink "$KERNARIUM/.build/dependencies/macos-arm64" || echo "$KERNARIUM/.build/dependencies/macos-arm64")"
+echo "  ios-device-arm64  -> $IOS_GPU_PREFIX"
 
 section "Configure Kernarium"
 
@@ -169,7 +229,7 @@ cmake \
     -DCMAKE_C_COMPILER="$IOS_CC" \
     -DCMAKE_CXX_COMPILER="$IOS_CXX" \
     -DCMAKE_OBJCXX_COMPILER="$IOS_CXX" \
-    -DAPPLE_GPU_PREFIX="$GPU_PREFIX"
+    -DAPPLE_GPU_PREFIX="$IOS_GPU_PREFIX"
 
 section "Build Kernarium"
 
@@ -181,7 +241,6 @@ section "Build output"
 
 echo "Build directory:"
 echo "$BUILD_DIR"
-
 echo
 
 find "$BUILD_DIR" \
@@ -199,6 +258,7 @@ find "$BUILD_DIR" \
 
 section "Kernarium build finished"
 
+echo
 echo "Kernarium iOS 16.4 build completed."
 echo
 echo "Build directory:"
