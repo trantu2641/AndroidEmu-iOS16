@@ -15,72 +15,151 @@ jobs:
     runs-on: macos-15
 
     steps:
-      - name: Checkout
+      # ==========================================================
+      # Checkout
+      # ==========================================================
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Select Xcode
+      # ==========================================================
+      # Select Xcode 16.4
+      # ==========================================================
+      - name: Select Xcode 16.4
         run: |
-          sudo xcode-select -s /Applications/Xcode_16.4.app
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+
+          echo "Xcode:"
           xcodebuild -version
 
+          echo
+          echo "SDK:"
+          xcrun --sdk iphoneos --show-sdk-path
+
+      # ==========================================================
+      # Install all Kernarium build dependencies
+      # ==========================================================
       - name: Install build dependencies
         run: |
-          brew install cmake ninja ccache python3 meson pkg-config
+          set -euo pipefail
 
-      - name: Create Python build environment
-        run: |
-          python3 -m venv "$RUNNER_TEMP/kernarium-venv"
+          brew update
 
-          "$RUNNER_TEMP/kernarium-venv/bin/python" \
-            -m pip install --upgrade pip
+          brew install \
+            cmake \
+            ninja \
+            ccache \
+            python3 \
+            meson \
+            pkg-config \
+            autoconf \
+            automake \
+            libtool \
+            gettext \
+            gperf
 
-          "$RUNNER_TEMP/kernarium-venv/bin/python" \
-            -m pip install PyYAML
+          echo
+          echo "Installed tools:"
+          echo
 
-          echo "$RUNNER_TEMP/kernarium-venv/bin" >> "$GITHUB_PATH"
-
-      - name: Verify build tools
-        run: |
           cmake --version
           ninja --version
-          python3 --version
           meson --version
           pkg-config --version
+          python3 --version
+          clang --version
 
-          python3 -c "import yaml; print('PyYAML:', yaml.__version__)"
+          echo
+          echo "Autotools:"
+          autoreconf --version
+          autoconf --version
+          automake --version
+
+          echo
+          echo "Libtool:"
+          glibtoolize --version || libtoolize --version
+
+          echo
+          echo "gettext:"
+          autopoint --version
+
+          echo
+          echo "gperf:"
+          gperf --version
+
+      # ==========================================================
+      # Python environment
+      # ==========================================================
+      - name: Prepare Python build environment
+        run: |
+          set -euo pipefail
+
+          python3 -m venv "$RUNNER_TEMP/kernarium-venv"
+
+          source "$RUNNER_TEMP/kernarium-venv/bin/activate"
+
+          python -m pip install --upgrade pip
+          python -m pip install PyYAML
 
           echo
           echo "Python:"
-          which python3
+          python --version
 
           echo
-          echo "Meson:"
-          which meson
+          echo "PyYAML:"
+          python -c "import yaml; print(yaml.__version__)"
 
+      # ==========================================================
+      # Fetch Kernarium
+      # ==========================================================
       - name: Fetch Kernarium
         run: |
           chmod +x scripts/fetch-kernarium.sh
-          ./scripts/fetch-kernarium.sh
+          scripts/fetch-kernarium.sh
 
-      - name: Patch iOS 16.4
+      # ==========================================================
+      # Patch Kernarium for iOS 16.4
+      # ==========================================================
+      - name: Patch Kernarium for iOS 16.4
         run: |
           chmod +x scripts/patch-ios16.sh
-          ./scripts/patch-ios16.sh Kernarium
+          scripts/patch-ios16.sh "$GITHUB_WORKSPACE/Kernarium"
 
+      # ==========================================================
+      # Build Kernarium
+      # ==========================================================
       - name: Build Kernarium
         run: |
           chmod +x scripts/build-kernarium.sh
-          ./scripts/build-kernarium.sh
+          scripts/build-kernarium.sh
 
-      - name: Stage Android
+      # ==========================================================
+      # Stage Android runtime
+      # ==========================================================
+      - name: Stage Android runtime
         run: |
           chmod +x scripts/stage-android.sh
-          ./scripts/stage-android.sh
+          scripts/stage-android.sh
 
-      - name: Build iOS application
+      # ==========================================================
+      # Build iOS application
+      # ==========================================================
+      - name: Build AndroidEmu.app
         run: |
+          set -euo pipefail
+
+          APP_DIR="$GITHUB_WORKSPACE/App"
+          PROJECT="$APP_DIR/AndroidEmu.xcodeproj"
+
+          if [ ! -d "$PROJECT" ]; then
+            echo "ERROR: Xcode project not found:"
+            echo "$PROJECT"
+            exit 1
+          fi
+
+          source "$RUNNER_TEMP/kernarium-venv/bin/activate"
+
           xcodebuild \
-            -project App/AndroidEmu.xcodeproj \
+            -project "$PROJECT" \
             -scheme AndroidEmu \
             -configuration Release \
             -sdk iphoneos \
@@ -88,15 +167,22 @@ jobs:
             IPHONEOS_DEPLOYMENT_TARGET=16.4 \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            build
+            clean build
 
+      # ==========================================================
+      # Package IPA
+      # ==========================================================
       - name: Package IPA
         run: |
           chmod +x scripts/package-ipa.sh
-          ./scripts/package-ipa.sh
+          scripts/package-ipa.sh
 
+      # ==========================================================
+      # Upload IPA
+      # ==========================================================
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: AndroidEmu-iOS16.4
           path: AndroidEmu-iOS16.4.ipa
+          if-no-files-found: error
