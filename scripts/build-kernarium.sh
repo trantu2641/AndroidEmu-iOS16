@@ -67,12 +67,64 @@ export GIT_COMMITTER_NAME="AndroidEmu Builder"
 export GIT_COMMITTER_EMAIL="androidemu-builder@localhost"
 
 ###############################################################################
-# Verify source
+# Build tools
+###############################################################################
+
+log "Verify build tools"
+
+required_tools=(
+    cmake
+    ninja
+    meson
+    pkg-config
+    python3
+    clang
+    autoreconf
+    autoconf
+    automake
+    glibtoolize
+    autopoint
+    gperf
+    git
+    curl
+    rsync
+    shasum
+)
+
+for tool in "${required_tools[@]}"; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        fail "Required build tool is missing: $tool"
+    fi
+done
+
+###############################################################################
+# Python
+###############################################################################
+
+log "Verify Python build environment"
+
+VENV="$RUNNER_TEMP/kernarium-venv"
+
+if [ ! -d "$VENV" ]; then
+    python3 -m venv "$VENV"
+fi
+
+source "$VENV/bin/activate"
+
+python -m pip install --upgrade pip
+python -m pip install PyYAML
+
+python --version
+python -c 'import yaml; print("PyYAML:", yaml.__version__)'
+
+###############################################################################
+# Verify Kernarium
 ###############################################################################
 
 log "Verify Kernarium source"
 
-[ -d "$KERNARIUM" ] || fail "Kernarium directory does not exist"
+[ -d "$KERNARIUM" ] ||
+    fail "Kernarium directory does not exist"
 
 cd "$KERNARIUM"
 
@@ -92,58 +144,249 @@ fi
 echo "Android AOSP 17: OK"
 
 ###############################################################################
-# IMPORTANT:
-#
-# Kernarium's dependency CMakeLists.txt is HOST macOS-only.
-#
-# The iOS product MUST NOT configure:
-#
-#   dependencies/CMakeLists.txt
-#
-# Therefore:
-#   - UML_APPLE_PLATFORM=ios
-#   - UML_BUILD_CLI=OFF
-#   - UML_BUILD_ANDROID17_CLI=OFF
-#   - UML_BUILD_GPU=OFF
-#   - UML_BUILD_AUDIO=OFF
-#   - UML_BUILD_NETWORK_PROVIDER=OFF
-#
-# The Apple GPU static libraries are built separately above/below and are
-# supplied explicitly to the iOS build only when the iOS target supports them.
-#
+# Dependency source root
 ###############################################################################
 
-log "Verify iOS build configuration"
+log "Prepare dependency source root"
 
-echo "UML_APPLE_PLATFORM : ios"
-echo "UML_BUILD_CLI      : OFF"
-echo "UML_BUILD_ANDROID17_CLI: OFF"
-echo "UML_BUILD_GPU      : OFF"
-echo "UML_BUILD_AUDIO    : OFF"
-echo "UML_BUILD_NETWORK_PROVIDER: OFF"
-echo "UML_BUILD_KERNARIUM_RUNTIME: ON"
+mkdir -p "$SOURCE_ROOT"
+mkdir -p "$KERNARIUM/.build/dependency-cache/archives"
 
 ###############################################################################
-# Verify host dependency prefix
+# libiconv archive fallback
+###############################################################################
+
+materialize_libiconv_git_repository()
+{
+    local archive="$1"
+    local destination="$2"
+
+    local expected_sha256
+    expected_sha256="3b08f5f4f9b4eb82f151a7040bfd6fe6c6fb922efe4b1659c66ea933276965e8"
+
+    local actual_sha256
+    actual_sha256="$(shasum -a 256 "$archive" | awk '{print $1}')"
+
+    if [ "$actual_sha256" != "$expected_sha256" ]; then
+        fail "libiconv archive SHA256 mismatch"
+    fi
+
+    rm -rf "$destination"
+
+    local temp_root
+    temp_root="$(mktemp -d "$KERNARIUM/.build/libiconv-source.XXXXXX")"
+
+    tar -xzf "$archive" -C "$temp_root"
+
+    local extracted
+    extracted="$(
+        find "$temp_root" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -name 'libiconv-*' \
+            -print \
+            -quit
+    )"
+
+    [ -n "$extracted" ] ||
+        fail "Could not locate extracted libiconv source directory"
+
+    mv "$extracted" "$destination"
+    rm -rf "$temp_root"
+
+    cd "$destination"
+
+    git init --quiet
+    git add -A
+
+    GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" \
+    GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
+    GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" \
+    GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL" \
+        git commit \
+        --quiet \
+        --allow-empty \
+        -m "libiconv 1.18 official GNU source archive"
+
+    local generated_commit
+    generated_commit="$(git rev-parse HEAD)"
+
+    git config uml.source.repository \
+        "https://git.savannah.gnu.org/git/libiconv.git"
+
+    git config uml.source.commit "$generated_commit"
+    git config uml.source.paths "."
+    git config uml.source.patchSeries "-"
+
+    git remote remove origin 2>/dev/null || true
+
+    [ -z "$(git status --porcelain --untracked-files=all)" ] ||
+        fail "Materialized libiconv repository is dirty"
+
+    printf '%s\n' "$generated_commit"
+}
+
+patch_libiconv_manifest()
+{
+    local manifest="$KERNARIUM/dependencies/manifest.tsv"
+    local commit="$1"
+
+    local temp_manifest
+    temp_manifest="$(mktemp "$KERNARIUM/.build/manifest.XXXXXX")"
+
+    awk -F '\t' -v OFS='\t' -v new_commit="$commit" '
+        $1 == "libiconv" {
+            $5 = new_commit
+            found = 1
+        }
+
+        {
+            print
+        }
+
+        END {
+            if (!found)
+                exit 1
+        }
+    ' "$manifest" > "$temp_manifest" || {
+        rm -f "$temp_manifest"
+        fail "Could not patch libiconv manifest"
+    }
+
+    mv "$temp_manifest" "$manifest"
+}
+
+###############################################################################
+# Prepare macOS dependency sources
+###############################################################################
+
+log "Prepare standard macOS dependencies"
+
+MACOS_PREPARE_LOG="$KERNARIUM/.build/macos-prepare.log"
+
+set +e
+
+"$KERNARIUM/dependencies/prepare.sh" \
+    --product macos \
+    --root "$SOURCE_ROOT" \
+    >"$MACOS_PREPARE_LOG" 2>&1
+
+MACOS_PREPARE_STATUS=$?
+
+set -e
+
+cat "$MACOS_PREPARE_LOG"
+
+if [ "$MACOS_PREPARE_STATUS" -ne 0 ]; then
+
+    if grep -Eq \
+        'libiconv\.git|libiconv.*Operation too slow|libiconv.*unable to access|libiconv.*Could not resolve' \
+        "$MACOS_PREPARE_LOG"; then
+
+        log "Recover libiconv from official GNU archive"
+
+        LIBICONV_ARCHIVE="$KERNARIUM/.build/dependency-cache/archives/libiconv-1.18.tar.gz"
+
+        if [ ! -f "$LIBICONV_ARCHIVE" ]; then
+            curl \
+                --fail \
+                --location \
+                --retry 5 \
+                --retry-delay 2 \
+                --connect-timeout 20 \
+                --max-time 300 \
+                --output "$LIBICONV_ARCHIVE" \
+                "https://ftp.gnu.org/gnu/libiconv/libiconv-1.18.tar.gz"
+        fi
+
+        LIBICONV_COMMIT="$(
+            materialize_libiconv_git_repository \
+                "$LIBICONV_ARCHIVE" \
+                "$SOURCE_ROOT/libiconv"
+        )"
+
+        patch_libiconv_manifest "$LIBICONV_COMMIT"
+
+        run "$KERNARIUM/dependencies/prepare.sh" \
+            --product macos \
+            --root "$SOURCE_ROOT"
+
+    else
+        fail "macOS dependency preparation failed"
+    fi
+fi
+
+###############################################################################
+# Verify macOS source repositories
+###############################################################################
+
+log "Verify prepared macOS dependency repositories"
+
+macos_repos=(
+    zlib
+    pcre2
+    libffi
+    gnulib
+    libiconv
+    proxy-libintl
+    glib
+    gvdb
+    libslirp
+    libvncserver
+)
+
+for repo in "${macos_repos[@]}"; do
+    [ -d "$SOURCE_ROOT/$repo/.git" ] ||
+        fail "macOS dependency source is missing: $repo"
+
+    echo "OK: $repo"
+done
+
+run "$KERNARIUM/dependencies/prepare.sh" \
+    --product macos \
+    --root "$SOURCE_ROOT" \
+    --verify
+
+###############################################################################
+# BUILD HOST DEPENDENCY PREFIX
+#
+# This MUST happen.
+#
+# Kernarium's iOS CMake configuration still verifies the private dependency
+# prefix. The prefix is a macOS host prefix and therefore MUST keep its own
+# deployment target of 14.0.
+###############################################################################
+
+log "Build Kernarium host dependency prefix"
+
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+
+echo "Host deployment target: $MACOSX_DEPLOYMENT_TARGET"
+
+run env \
+    MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+    UML_DEPENDENCY_SOURCE_ROOT="$SOURCE_ROOT" \
+    UML_DEPENDENCY_PREFIX="$HOST_PREFIX" \
+    UML_DEPENDENCY_BUILD_ROOT="$HOST_WORK_ROOT" \
+    UML_DEPENDENCY_JOBS="$CPU_CORES" \
+    "$KERNARIUM/dependencies/build.sh" \
+    --source-root "$SOURCE_ROOT" \
+    --prefix "$HOST_PREFIX" \
+    --work-root "$HOST_WORK_ROOT" \
+    --jobs "$CPU_CORES"
+
+###############################################################################
+# Verify host prefix
 ###############################################################################
 
 log "Verify host dependency prefix"
 
-if [ ! -d "$HOST_PREFIX" ]; then
-    fail "Host dependency prefix is missing: $HOST_PREFIX"
-fi
-
-if [ -L "$HOST_PREFIX" ]; then
-    fail "Host dependency prefix must not be a symbolic link: $HOST_PREFIX"
-fi
-
 HOST_RECEIPT="$HOST_PREFIX/share/uml-dependencies/receipt.tsv"
 
-if [ ! -f "$HOST_RECEIPT" ]; then
+[ -f "$HOST_RECEIPT" ] ||
     fail "Host dependency receipt is missing: $HOST_RECEIPT"
-fi
 
-echo
 echo "Host dependency prefix:"
 echo "$HOST_PREFIX"
 
@@ -152,18 +395,45 @@ echo "Host dependency receipt:"
 cat "$HOST_RECEIPT"
 
 ###############################################################################
+# Prepare Apple GPU sources
+###############################################################################
+
+log "Prepare Apple GPU dependency sources"
+
+run "$KERNARIUM/dependencies/prepare.sh" \
+    --product apple-gpu \
+    --root "$SOURCE_ROOT"
+
+gpu_repos=(
+    utm-webkit
+    utm-libepoxy
+    utm-virglrenderer
+)
+
+for repo in "${gpu_repos[@]}"; do
+    [ -d "$SOURCE_ROOT/$repo/.git" ] ||
+        fail "Apple GPU dependency source is missing: $repo"
+
+    echo "OK: $repo"
+done
+
+###############################################################################
+# Build Apple GPU dependencies
+###############################################################################
+
+log "Build Apple GPU dependencies for iOS"
+
+run "$KERNARIUM/dependencies/build-apple-gpu.sh" \
+    --platform ios
+
+###############################################################################
 # Verify iOS GPU prefix
 ###############################################################################
 
 log "Verify iOS GPU dependency prefix"
 
-if [ ! -d "$IOS_GPU_PREFIX" ]; then
-    fail "iOS Apple GPU prefix is missing: $IOS_GPU_PREFIX"
-fi
-
-if [ -L "$IOS_GPU_PREFIX" ]; then
-    fail "iOS Apple GPU prefix must not be a symbolic link"
-fi
+[ -d "$IOS_GPU_PREFIX" ] ||
+    fail "iOS Apple GPU prefix was not created: $IOS_GPU_PREFIX"
 
 IOS_EPOXY="$IOS_GPU_PREFIX/lib/libepoxy.a"
 IOS_VIRGL="$IOS_GPU_PREFIX/lib/libvirglrenderer.a"
@@ -174,30 +444,20 @@ IOS_VIRGL="$IOS_GPU_PREFIX/lib/libvirglrenderer.a"
 [ -f "$IOS_VIRGL" ] ||
     fail "Missing iOS libvirglrenderer.a: $IOS_VIRGL"
 
-echo
-echo "iOS Apple GPU prefix:"
-echo "$IOS_GPU_PREFIX"
-
 ls -lh \
     "$IOS_EPOXY" \
     "$IOS_VIRGL"
 
 ###############################################################################
-# Clean iOS build tree
+# Configure Kernarium
 ###############################################################################
 
-log "Clean Kernarium iOS build tree"
+log "Configure Kernarium iOS build"
 
 BUILD_DIR="$KERNARIUM/.build/ios-arm64"
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
-
-###############################################################################
-# Configure Kernarium for iOS
-###############################################################################
-
-log "Configure Kernarium iOS $IOS_VERSION"
 
 cd "$KERNARIUM"
 
@@ -210,22 +470,19 @@ echo "iOS SDK:"
 echo "$IOS_SDK"
 
 echo
-echo "iOS clang:"
-echo "$IOS_CLANG"
+echo "iOS deployment target:"
+echo "$IOS_VERSION"
 
 ###############################################################################
-# CRITICAL:
+# IMPORTANT
 #
-# Do NOT pass UML_DEPENDENCY_PREFIX here.
+# The host prefix remains:
 #
-# Do NOT configure the host dependencies/CMakeLists.txt.
+#   .build/dependencies/macos-arm64
 #
-# Do NOT use:
+# and MUST NOT be rebuilt as iOS 16.4.
 #
-#   -DCMAKE_OSX_DEPLOYMENT_TARGET=16.4
-#   with the macOS private dependency prefix.
-#
-# The iOS configuration is isolated from the host dependency prefix.
+# The iOS target itself is explicitly selected here.
 ###############################################################################
 
 run cmake \
@@ -248,10 +505,7 @@ run cmake \
     -DUML_BUILD_KERNARIUM_RUNTIME=ON \
     -DUML_BUILD_UNIT_TESTS=OFF \
     -DUML_BUILD_INTEGRATION_TESTS=OFF \
-    -DUML_BUILD_TOOLING_TESTS=OFF \
-    -DUML_BUILD_WINE_ARM64EC=OFF \
-    -DUML_MAINLINE_KERNEL_SLICE=arm64 \
-    -DUML_MAINLINE_KERNEL_PROFILE=standard
+    -DUML_BUILD_TOOLING_TESTS=OFF
 
 ###############################################################################
 # Build
@@ -261,7 +515,7 @@ log "Build Kernarium"
 
 run cmake \
     --build "$BUILD_DIR" \
-    --parallel "$CPU_CORES
+    --parallel "$CPU_CORES"
 
 ###############################################################################
 # Install
@@ -272,17 +526,16 @@ log "Install Kernarium"
 INSTALL_PREFIX="$KERNARIUM/.build/install-ios"
 
 rm -rf "$INSTALL_PREFIX"
-mkdir -p "$INSTALL_PREFIX"
 
 run cmake \
     --install "$BUILD_DIR" \
     --prefix "$INSTALL_PREFIX"
 
 ###############################################################################
-# Verify
+# Final verification
 ###############################################################################
 
-log "Kernarium iOS build completed"
+log "Kernarium build completed"
 
 echo
 echo "Build directory:"
@@ -291,9 +544,6 @@ echo "$BUILD_DIR"
 echo
 echo "Install directory:"
 echo "$INSTALL_PREFIX"
-
-echo
-echo "Generated files:"
 
 find "$INSTALL_PREFIX" \
     -maxdepth 5 \
@@ -304,5 +554,5 @@ find "$INSTALL_PREFIX" \
 
 echo
 echo "========================================"
-echo "Kernarium iOS build: SUCCESS"
+echo "Kernarium build: SUCCESS"
 echo "========================================"
