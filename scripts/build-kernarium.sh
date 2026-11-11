@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 
 set -euo pipefail
@@ -45,17 +44,14 @@ if [ "$(uname -m)" != "arm64" ]; then
     fail "Kernarium Apple GPU build requires an arm64 macOS runner."
 fi
 
-if ! command -v xcodebuild >/dev/null 2>&1; then
+command -v xcodebuild >/dev/null 2>&1 ||
     fail "xcodebuild not found."
-fi
 
-if ! command -v xcrun >/dev/null 2>&1; then
+command -v xcrun >/dev/null 2>&1 ||
     fail "xcrun not found."
-fi
 
-if ! command -v cmake >/dev/null 2>&1; then
+command -v cmake >/dev/null 2>&1 ||
     fail "cmake not found."
-fi
 
 echo "macOS      : $(sw_vers -productVersion)"
 echo "Xcode      : $(xcodebuild -version | head -1)"
@@ -65,11 +61,25 @@ echo "Kernarium  : $KERNARIUM"
 
 section "Configure Git identity"
 
-git config user.name "AndroidEmu Builder"
-git config user.email "androidemu-builder@localhost"
+#
+# dependencies/prepare.sh checks the GLOBAL Git identity.
+# Local repository config is not enough.
+#
 
-echo "Git user : $(git config user.name)"
-echo "Git email: $(git config user.email)"
+git config --global user.name "AndroidEmu Builder"
+git config --global user.email "androidemu-builder@localhost"
+
+# Also provide the identity through environment variables.
+# This makes the build independent of which Git config scope
+# prepare.sh happens to inspect.
+export GIT_AUTHOR_NAME="AndroidEmu Builder"
+export GIT_AUTHOR_EMAIL="androidemu-builder@localhost"
+export GIT_COMMITTER_NAME="AndroidEmu Builder"
+export GIT_COMMITTER_EMAIL="androidemu-builder@localhost"
+
+echo "Git global user : $(git config --global user.name)"
+echo "Git global email: $(git config --global user.email)"
+echo "Committer       : $GIT_COMMITTER_NAME <$GIT_COMMITTER_EMAIL>"
 
 section "Prepare Kernarium dependencies"
 
@@ -85,9 +95,10 @@ mkdir -p "$DEPENDENCY_ROOT"
 #
 # IMPORTANT:
 #
-# dependencies/build-apple-gpu.sh calls prepare.sh with --verify.
-# Therefore the dependency sources MUST be materialized first.
+# build-apple-gpu.sh itself calls prepare.sh with --verify.
+# Therefore prepare.sh must run once WITHOUT --verify first.
 #
+
 "$KERNARIUM/dependencies/prepare.sh" \
     --product apple-gpu \
     --root "$DEPENDENCY_ROOT"
@@ -98,8 +109,12 @@ fi
 
 echo
 echo "Prepared dependency sources:"
-find "$DEPENDENCY_ROOT" -mindepth 1 -maxdepth 1 -type d \
-    -print | sort
+find "$DEPENDENCY_ROOT" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    -type d \
+    -print \
+    | sort
 
 section "Build Apple GPU dependency"
 
@@ -141,7 +156,6 @@ echo "OK: $VIRGL"
 section "Configure Kernarium"
 
 rm -rf "$BUILD_DIR"
-
 mkdir -p "$BUILD_DIR"
 
 cmake \
