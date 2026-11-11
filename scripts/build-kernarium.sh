@@ -6,15 +6,17 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KERNARIUM="$ROOT/Kernarium"
 
 IOS_VERSION="${IOS_VERSION:-16.4}"
-IOS_PLATFORM="ios"
-IOS_ARCH="arm64"
+CPU_CORES="$(sysctl -n hw.ncpu 2>/dev/null || echo 3)"
 
 BUILD_DIR="$KERNARIUM/.build"
-CMAKE_BUILD_DIR="$BUILD_DIR/kernarium-ios16"
-MACOS_PREFIX="$BUILD_DIR/dependencies/macos-arm64"
+SOURCE_ROOT="$KERNARIUM/external/sources"
+
+HOST_PREFIX="$BUILD_DIR/dependencies/macos-arm64"
 IOS_GPU_PREFIX="$BUILD_DIR/dependencies/apple-gpu/ios-device-arm64"
 
-CPU_CORES="$(sysctl -n hw.ncpu 2>/dev/null || echo 3)"
+HOST_WORK_ROOT="$BUILD_DIR/dependency-build"
+CMAKE_BUILD_DIR="$BUILD_DIR/kernarium-ios16"
+INSTALL_DIR="$BUILD_DIR/install-ios"
 
 section()
 {
@@ -33,21 +35,21 @@ fail()
 
 require_file()
 {
-    local file="$1"
+    local path="$1"
 
-    if [ ! -f "$file" ]; then
+    if [ ! -f "$path" ]; then
         fail "Required file does not exist:
-$file"
+$path"
     fi
 }
 
 require_dir()
 {
-    local dir="$1"
+    local path="$1"
 
-    if [ ! -d "$dir" ]; then
+    if [ ! -d "$path" ]; then
         fail "Required directory does not exist:
-$dir"
+$path"
     fi
 }
 
@@ -58,27 +60,26 @@ run()
     "$@"
 }
 
-# ------------------------------------------------------------
-# Environment
-# ------------------------------------------------------------
+# ============================================================
+# ENVIRONMENT
+# ============================================================
 
 section "Checking environment"
 
-echo
 echo "macOS       : $(sw_vers -productVersion)"
 echo "Xcode       : $(xcodebuild -version | head -1)"
 echo "iOS SDK     : $(xcrun --sdk iphoneos --show-sdk-path)"
 echo "CPU cores   : $CPU_CORES"
 echo "Kernarium   : $KERNARIUM"
 echo "iOS target  : $IOS_VERSION"
-echo "Architecture: $IOS_ARCH"
+echo "Architecture: arm64"
 
 require_dir "$KERNARIUM"
 require_file "$KERNARIUM/CMakeLists.txt"
 
-# ------------------------------------------------------------
-# Git identity
-# ------------------------------------------------------------
+# ============================================================
+# GIT IDENTITY
+# ============================================================
 
 section "Configure Git identity"
 
@@ -94,32 +95,17 @@ echo "Git global user : $(git config --global user.name)"
 echo "Git global email: $(git config --global user.email)"
 echo "Committer       : ${GIT_COMMITTER_NAME} <${GIT_COMMITTER_EMAIL}>"
 
-# ------------------------------------------------------------
-# Toolchain
-# ------------------------------------------------------------
+# ============================================================
+# BUILD TOOLS
+# ============================================================
 
 section "Verify build tools"
 
-command -v cmake >/dev/null 2>&1 ||
-    fail "cmake is unavailable"
-
-command -v ninja >/dev/null 2>&1 ||
-    fail "ninja is unavailable"
-
-command -v meson >/dev/null 2>&1 ||
-    fail "meson is unavailable"
-
-command -v pkg-config >/dev/null 2>&1 ||
-    fail "pkg-config is unavailable"
-
-command -v python3 >/dev/null 2>&1 ||
-    fail "python3 is unavailable"
-
-command -v xcodebuild >/dev/null 2>&1 ||
-    fail "xcodebuild is unavailable"
-
-command -v xcrun >/dev/null 2>&1 ||
-    fail "xcrun is unavailable"
+for tool in cmake ninja meson pkg-config python3 git xcodebuild xcrun; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        fail "required build tool is unavailable: $tool"
+    fi
+done
 
 echo
 echo "cmake      : $(cmake --version | head -1)"
@@ -129,50 +115,36 @@ echo "pkg-config : $(pkg-config --version)"
 echo "python3    : $(python3 --version)"
 echo "clang      : $(clang --version | head -1)"
 
-# ------------------------------------------------------------
-# Python / PyYAML
-# ------------------------------------------------------------
+# ============================================================
+# PYTHON / PYYAML
+# ============================================================
 
 section "Verify Python build environment"
 
-PYTHON_BIN="$(command -v python3)"
-
-if "$PYTHON_BIN" -c "import yaml" >/dev/null 2>&1; then
+if python3 -c "import yaml" >/dev/null 2>&1; then
 
     echo "PyYAML available:"
-    "$PYTHON_BIN" -c \
+    python3 -c \
         'import yaml; print("  PyYAML:", yaml.__version__)'
 
 else
 
-    echo "System Python does not contain PyYAML."
+    VENV_DIR="${RUNNER_TEMP:-$BUILD_DIR}/kernarium-venv"
 
-    if [ -x "${RUNNER_TEMP:-/tmp}/kernarium-venv/bin/python" ]; then
+    echo
+    echo "Creating Python virtual environment:"
+    echo "$VENV_DIR"
 
-        PYTHON_BIN="${RUNNER_TEMP}/kernarium-venv/bin/python"
+    python3 -m venv "$VENV_DIR"
 
-    else
+    "$VENV_DIR/bin/python" \
+        -m pip install --upgrade pip
 
-        VENV_DIR="${RUNNER_TEMP:-$ROOT/.build}/kernarium-venv"
+    "$VENV_DIR/bin/python" \
+        -m pip install PyYAML
 
-        echo
-        echo "Creating Python virtual environment:"
-        echo "$VENV_DIR"
-
-        python3 -m venv "$VENV_DIR"
-
-        "$VENV_DIR/bin/python" \
-            -m pip install --upgrade pip
-
-        "$VENV_DIR/bin/python" \
-            -m pip install PyYAML
-
-        PYTHON_BIN="$VENV_DIR/bin/python"
-    fi
-
+    export PATH="$VENV_DIR/bin:$PATH"
 fi
-
-export PATH="$(dirname "$PYTHON_BIN"):$PATH"
 
 echo
 echo "Python:"
@@ -182,9 +154,9 @@ echo "PyYAML:"
 python3 -c \
     'import yaml; print(yaml.__version__)'
 
-# ------------------------------------------------------------
-# Verify Kernarium source
-# ------------------------------------------------------------
+# ============================================================
+# VERIFY KERNARIUM
+# ============================================================
 
 section "Verify Kernarium source"
 
@@ -193,47 +165,56 @@ cd "$KERNARIUM"
 echo "Kernarium commit:"
 git rev-parse HEAD
 
-echo
-echo "Android AOSP 17:"
 if [ -d "$KERNARIUM/android/aosp-17" ]; then
+    echo
+    echo "Android AOSP 17:"
     echo "  OK"
 else
-    fail "Kernarium android/aosp-17 directory is missing"
+    fail "android/aosp-17 source tree is missing"
 fi
 
-# ------------------------------------------------------------
-# Prepare dependency source trees
-# ------------------------------------------------------------
+# ============================================================
+# PREPARE DEPENDENCY SOURCE TREES
+#
+# IMPORTANT:
+#
+# DO NOT:
+#
+#   rm -rf external/sources/utm-webkit
+#
+# followed by:
+#
+#   prepare.sh --verify
+#
+# because --verify is verification-only.
+#
+# First call prepare.sh WITHOUT --verify.
+# It will fetch/materialize the pinned Git repositories.
+#
+# After that, dependencies/build.sh can safely use --verify.
+# ============================================================
 
 section "Prepare Kernarium dependency sources"
-
-SOURCE_ROOT="$KERNARIUM/external/sources"
 
 mkdir -p "$SOURCE_ROOT"
 
 echo "Dependency source root:"
 echo "$SOURCE_ROOT"
 
-# Do not leave half-created Git repositories behind.
-rm -rf \
-    "$SOURCE_ROOT/utm-webkit" \
-    "$SOURCE_ROOT/utm-libepoxy" \
-    "$SOURCE_ROOT/utm-virglrenderer"
-
 echo
 echo "Running dependencies/prepare.sh..."
 
 export UML_DEPENDENCY_SOURCE_ROOT="$SOURCE_ROOT"
+export UML_DEPENDENCY_PRODUCT="apple-gpu"
 
 run \
     "$KERNARIUM/dependencies/prepare.sh" \
     --product apple-gpu \
-    --root "$SOURCE_ROOT" \
-    --verify
+    --root "$SOURCE_ROOT"
 
-# ------------------------------------------------------------
-# Verify prepared sources
-# ------------------------------------------------------------
+# ============================================================
+# VERIFY PREPARED APPLE GPU SOURCES
+# ============================================================
 
 section "Verify prepared dependency repositories"
 
@@ -242,6 +223,7 @@ for repo in \
     utm-libepoxy \
     utm-virglrenderer
 do
+
     if [ ! -d "$SOURCE_ROOT/$repo/.git" ]; then
         fail "Prepared Git repository is missing:
 $SOURCE_ROOT/$repo"
@@ -250,78 +232,88 @@ $SOURCE_ROOT/$repo"
     echo "OK: $repo"
 done
 
-# ------------------------------------------------------------
-# Clean only generated build output
-# ------------------------------------------------------------
+# ============================================================
+# SHOW PREPARED SOURCE REVISIONS
+# ============================================================
 
-section "Clean previous Kernarium build output"
+section "Show dependency source revisions"
 
-rm -rf \
-    "$BUILD_DIR/dependency-build" \
-    "$BUILD_DIR/kernarium-ios16"
+for repo in \
+    utm-webkit \
+    utm-libepoxy \
+    utm-virglrenderer
+do
 
-# ------------------------------------------------------------
-# Build HOST dependencies
+    echo
+    echo "$repo:"
+    git -C "$SOURCE_ROOT/$repo" rev-parse HEAD
+done
+
+# ============================================================
+# BUILD HOST DEPENDENCIES
 #
-# IMPORTANT:
-# Do NOT fake macos-arm64 by copying the Apple GPU prefix.
+# Kernarium's own dependencies/build.sh performs:
 #
-# Kernarium's dependencies/build.sh creates:
+#   prepare.sh --product macos --verify
+#
+# and then builds:
 #
 #   .build/dependencies/macos-arm64/
-#       include/
-#       lib/
-#       share/
-#           uml-dependencies/
-#               receipt.tsv
 #
-# CMake VerifyDependencies.cmake requires that receipt.
-# ------------------------------------------------------------
+# including:
+#
+#   share/uml-dependencies/receipt.tsv
+#
+# We MUST NOT fake this prefix by copying GPU libraries.
+# ============================================================
 
 section "Build Kernarium host dependency prefix"
 
+mkdir -p "$BUILD_DIR"
+
+export UML_DEPENDENCY_SOURCE_ROOT="$SOURCE_ROOT"
 export UML_DEPENDENCY_JOBS="$CPU_CORES"
 export MACOSX_DEPLOYMENT_TARGET="14.0"
 
 run \
     "$KERNARIUM/dependencies/build.sh" \
     --source-root "$SOURCE_ROOT" \
-    --prefix "$MACOS_PREFIX" \
-    --work-root "$BUILD_DIR/dependency-build" \
+    --prefix "$HOST_PREFIX" \
+    --work-root "$HOST_WORK_ROOT" \
     --jobs "$CPU_CORES"
 
-# ------------------------------------------------------------
-# Verify HOST dependency prefix
-# ------------------------------------------------------------
+# ============================================================
+# VERIFY HOST PREFIX
+# ============================================================
 
 section "Verify Kernarium host dependency prefix"
 
-require_dir "$MACOS_PREFIX"
+require_dir "$HOST_PREFIX"
 
 require_file \
-    "$MACOS_PREFIX/share/uml-dependencies/receipt.tsv"
+    "$HOST_PREFIX/share/uml-dependencies/receipt.tsv"
 
 require_file \
-    "$MACOS_PREFIX/lib/libepoxy.a"
+    "$HOST_PREFIX/lib/libepoxy.a"
 
 require_file \
-    "$MACOS_PREFIX/lib/libvirglrenderer.a"
+    "$HOST_PREFIX/lib/libvirglrenderer.a"
 
 echo
 echo "Host dependency receipt:"
-cat "$MACOS_PREFIX/share/uml-dependencies/receipt.tsv"
+cat "$HOST_PREFIX/share/uml-dependencies/receipt.tsv"
 
 echo
 echo "Host libepoxy:"
-ls -lh "$MACOS_PREFIX/lib/libepoxy.a"
+ls -lh "$HOST_PREFIX/lib/libepoxy.a"
 
 echo
 echo "Host libvirglrenderer:"
-ls -lh "$MACOS_PREFIX/lib/libvirglrenderer.a"
+ls -lh "$HOST_PREFIX/lib/libvirglrenderer.a"
 
-# ------------------------------------------------------------
-# Build iOS Apple GPU dependencies
-# ------------------------------------------------------------
+# ============================================================
+# BUILD iOS APPLE GPU DEPENDENCIES
+# ============================================================
 
 section "Build iOS Apple GPU dependency"
 
@@ -329,11 +321,11 @@ export UML_DEPENDENCY_SOURCE_ROOT="$SOURCE_ROOT"
 
 run \
     "$KERNARIUM/dependencies/build-apple-gpu.sh" \
-    --platform "$IOS_PLATFORM"
+    --platform ios
 
-# ------------------------------------------------------------
-# Verify iOS Apple GPU prefix
-# ------------------------------------------------------------
+# ============================================================
+# VERIFY iOS GPU PREFIX
+# ============================================================
 
 section "Verify iOS Apple GPU dependency"
 
@@ -355,50 +347,38 @@ echo "iOS libvirglrenderer.a:"
 ls -lh \
     "$IOS_GPU_PREFIX/lib/libvirglrenderer.a"
 
-# ------------------------------------------------------------
-# Important:
-# Kernarium's iOS CMake configuration still expects the private
-# dependency prefix at:
-#
-#   .build/dependencies/macos-arm64
-#
-# BUT that prefix must remain the REAL host prefix.
-#
-# The iOS Apple GPU libraries are supplied separately through:
-#
-#   UML_APPLE_GPU_DEPENDENCY_PREFIX
-#
-# if supported by the CMake dependency module.
-# ------------------------------------------------------------
+# ============================================================
+# CLEAN CMAKE BUILD
+# ============================================================
 
-section "Prepare iOS GPU dependency configuration"
+section "Prepare Kernarium CMake build"
 
-if [ -f "$KERNARIUM/dependencies/cmake/AppleGpuDependencies.cmake" ]; then
+rm -rf "$CMAKE_BUILD_DIR"
+mkdir -p "$CMAKE_BUILD_DIR"
 
-    echo "Apple GPU CMake module:"
-    echo "$KERNARIUM/dependencies/cmake/AppleGpuDependencies.cmake"
-
-else
-
-    fail "AppleGpuDependencies.cmake is missing"
-
-fi
-
-# ------------------------------------------------------------
-# Configure Kernarium
-# ------------------------------------------------------------
+# ============================================================
+# CMAKE CONFIGURATION
+# ============================================================
 
 section "Configure Kernarium iOS $IOS_VERSION"
 
-rm -rf "$CMAKE_BUILD_DIR"
-
-mkdir -p "$CMAKE_BUILD_DIR"
-
 cd "$KERNARIUM"
 
-export CMAKE_PREFIX_PATH="$MACOS_PREFIX"
-export PKG_CONFIG_PATH="$MACOS_PREFIX/lib/pkgconfig"
-export PKG_CONFIG_LIBDIR="$MACOS_PREFIX/lib/pkgconfig"
+export CMAKE_PREFIX_PATH="$HOST_PREFIX"
+export PKG_CONFIG_PATH="$HOST_PREFIX/lib/pkgconfig"
+export PKG_CONFIG_LIBDIR="$HOST_PREFIX/lib/pkgconfig"
+
+echo
+echo "Host dependency prefix:"
+echo "$HOST_PREFIX"
+
+echo
+echo "iOS GPU dependency prefix:"
+echo "$IOS_GPU_PREFIX"
+
+echo
+echo "CMake build directory:"
+echo "$CMAKE_BUILD_DIR"
 
 cmake \
     -S "$KERNARIUM" \
@@ -408,27 +388,20 @@ cmake \
     -DCMAKE_OSX_SYSROOT=iphoneos \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_VERSION" \
-    -DCMAKE_INSTALL_PREFIX="$BUILD_DIR/install-ios" \
+    -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
+    -DUML_DEPENDENCY_PREFIX="$HOST_PREFIX" \
+    -DUML_APPLE_GPU_DEPENDENCY_PREFIX="$IOS_GPU_PREFIX" \
     -DUML_APPLE_PLATFORM=ios \
-    -DUML_BUILD_CLI=OFF \
-    -DUML_BUILD_ANDROID17_CLI=OFF \
-    -DUML_BUILD_KERNEL_RUNNER=OFF \
-    -DUML_BUILD_UNIT_TESTS=OFF \
-    -DUML_BUILD_INTEGRATION_TESTS=OFF \
-    -DUML_BUILD_TOOLING_TESTS=OFF \
     -DUML_BUILD_GPU=ON \
     -DUML_BUILD_AUDIO=ON \
     -DUML_BUILD_NETWORK_PROVIDER=ON \
-    -DUML_BUILD_KERNARIUM_RUNTIME=ON \
-    -DUML_GUEST_16K_PAGES=ON \
-    -DUML_MAINLINE_KERNEL_SLICE=arm64 \
-    -DUML_MAINLINE_KERNEL_PROFILE=standard \
-    -DUML_BUILD_WINE_ARM64EC=OFF \
-    -DUML_DEPENDENCY_PREFIX="$MACOS_PREFIX"
+    -DUML_BUILD_UNIT_TESTS=OFF \
+    -DUML_BUILD_INTEGRATION_TESTS=OFF \
+    -DUML_BUILD_TOOLING_TESTS=OFF
 
-# ------------------------------------------------------------
-# Build Kernarium
-# ------------------------------------------------------------
+# ============================================================
+# BUILD
+# ============================================================
 
 section "Build Kernarium iOS $IOS_VERSION"
 
@@ -436,101 +409,101 @@ cmake \
     --build "$CMAKE_BUILD_DIR" \
     --parallel "$CPU_CORES"
 
-# ------------------------------------------------------------
-# Install
-# ------------------------------------------------------------
+# ============================================================
+# INSTALL
+# ============================================================
 
 section "Install Kernarium iOS build"
 
-rm -rf "$BUILD_DIR/install-ios"
+rm -rf "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR"
 
 cmake \
     --install "$CMAKE_BUILD_DIR"
 
-# ------------------------------------------------------------
-# Locate generated binaries
-# ------------------------------------------------------------
+# ============================================================
+# LOCATE OUTPUTS
+# ============================================================
 
 section "Locate Kernarium outputs"
 
 echo
-echo "Executable files:"
+echo "Build directory:"
+du -sh "$CMAKE_BUILD_DIR" || true
+
+echo
+echo "Generated files:"
 
 find "$CMAKE_BUILD_DIR" \
     -type f \
-    \( -perm -111 -o -name "*.a" -o -name "*.dylib" \) \
+    \( \
+        -perm -111 \
+        -o -name "*.a" \
+        -o -name "*.dylib" \
+        -o -name "*.framework" \
+    \) \
     -print \
     | head -200
 
 echo
 echo "Installed files:"
 
-if [ -d "$BUILD_DIR/install-ios" ]; then
+if [ -d "$INSTALL_DIR" ]; then
 
-    find "$BUILD_DIR/install-ios" \
+    find "$INSTALL_DIR" \
         -type f \
         -print \
         | head -200
 
 else
 
-    echo "No install directory generated."
+    echo "Install directory was not generated."
 
 fi
 
-# ------------------------------------------------------------
-# Verify build tree
-# ------------------------------------------------------------
+# ============================================================
+# VERIFY CMAKE
+# ============================================================
 
 section "Verify Kernarium build"
 
-if [ -f "$CMAKE_BUILD_DIR/CMakeCache.txt" ]; then
-    echo "CMake configuration: OK"
-else
-    fail "CMakeCache.txt was not generated"
-fi
+require_file \
+    "$CMAKE_BUILD_DIR/CMakeCache.txt"
 
-if [ -f "$CMAKE_BUILD_DIR/codemodel-v2.json" ] || \
-   find "$CMAKE_BUILD_DIR/.cmake/api/v1/reply" \
-       -type f \
-       -name "codemodel-v2*.json" \
-       -print -quit \
-       | grep -q .
-then
-    echo "CMake File API: OK"
-fi
+echo
+echo "CMake configuration: OK"
 
-# ------------------------------------------------------------
-# Export useful paths for later scripts
-# ------------------------------------------------------------
+# ============================================================
+# EXPORT BUILD ENVIRONMENT
+# ============================================================
 
 cat > "$BUILD_DIR/kernarium-build-env.sh" <<EOF
 export KERNARIUM_ROOT="$KERNARIUM"
 export KERNARIUM_BUILD_DIR="$CMAKE_BUILD_DIR"
-export KERNARIUM_INSTALL_DIR="$BUILD_DIR/install-ios"
-export KERNARIUM_HOST_PREFIX="$MACOS_PREFIX"
+export KERNARIUM_INSTALL_DIR="$INSTALL_DIR"
+export KERNARIUM_HOST_PREFIX="$HOST_PREFIX"
 export KERNARIUM_IOS_GPU_PREFIX="$IOS_GPU_PREFIX"
-export KERNARIUM_IOS_ARCH="$IOS_ARCH"
 export KERNARIUM_IOS_VERSION="$IOS_VERSION"
+export KERNARIUM_IOS_ARCH="arm64"
 EOF
 
 echo
 echo "Build environment:"
 cat "$BUILD_DIR/kernarium-build-env.sh"
 
-# ------------------------------------------------------------
-# Done
-# ------------------------------------------------------------
+# ============================================================
+# DONE
+# ============================================================
 
 section "Kernarium iOS build completed"
 
 echo
-echo "Kernarium build directory:"
+echo "Kernarium build:"
 echo "$CMAKE_BUILD_DIR"
 
 echo
 echo "Host dependency prefix:"
-echo "$MACOS_PREFIX"
+echo "$HOST_PREFIX"
 
 echo
 echo "iOS GPU dependency prefix:"
@@ -538,7 +511,7 @@ echo "$IOS_GPU_PREFIX"
 
 echo
 echo "Install directory:"
-echo "$BUILD_DIR/install-ios"
+echo "$INSTALL_DIR"
 
 echo
 echo "SUCCESS"
