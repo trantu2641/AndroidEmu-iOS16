@@ -45,7 +45,12 @@ fail()
 log "Checking environment"
 
 echo "macOS       : $(sw_vers -productVersion)"
-echo "Xcode       : $(xcodebuild -version | head -1)"
+
+# Không dùng pipe xcodebuild | head.
+# Xcode 16.4 đôi khi crash Broken pipe khi head đóng stdout quá sớm.
+XCODE_VERSION="$(xcodebuild -version 2>/dev/null || true)"
+echo "Xcode       : $(printf '%s\n' "$XCODE_VERSION" | sed -n '1p')"
+
 echo "iOS SDK     : $(xcrun --sdk iphoneos --show-sdk-path)"
 echo "CPU cores   : $CPU_CORES"
 echo "Kernarium   : $KERNARIUM"
@@ -150,111 +155,151 @@ echo "Android AOSP 17: OK"
 log "Prepare dependency source root"
 
 mkdir -p "$SOURCE_ROOT"
+mkdir -p "$KERNARIUM/.build/dependency-cache"
+mkdir -p "$KERNARIUM/.build/dependency-cache/git"
 mkdir -p "$KERNARIUM/.build/dependency-cache/archives"
 
 ###############################################################################
-# libiconv archive fallback
+# Materialize a pinned dependency from a GitHub mirror
+#
+# Important:
+#
+# The upstream identity remains the URL from Kernarium's manifest.
+# We only use GitHub as the transport source.
+#
+# After materialization:
+#   - exact pinned commit exists
+#   - no network remote remains
+#   - uml.source.repository = original upstream URL
+#   - uml.source.commit = exact pinned upstream commit
+#   - uml.source.paths = .
+#   - uml.source.patchSeries = -
+#
+# This satisfies Kernarium's verify_repository() rules without inventing
+# another commit or changing the dependency manifest.
 ###############################################################################
 
-materialize_libiconv_git_repository()
+materialize_git_mirror()
 {
-    local archive="$1"
-    local destination="$2"
+    local name="$1"
+    local mirror_url="$2"
+    local upstream_url="$3"
+    local commit="$4"
+    local destination="$5"
 
-    local expected_sha256
-    expected_sha256="3b08f5f4f9b4eb82f151a7040bfd6fe6c6fb922efe4b1659c66ea933276965e8"
+    log "Materialize $name from GitHub mirror"
 
-    local actual_sha256
-    actual_sha256="$(shasum -a 256 "$archive" | awk '{print $1}')"
+    if [ -d "$destination/.git" ]; then
+        echo "$name source already exists"
 
-    if [ "$actual_sha256" != "$expected_sha256" ]; then
-        fail "libiconv archive SHA256 mismatch"
+        local existing_commit
+        existing_commit="$(git -C "$destination" rev-parse "$commit^{commit}" 2>/dev/null || true)"
+
+        if [ "$existing_commit" = "$commit" ]; then
+            echo "Pinned commit already exists: $commit"
+        else
+            fail "$name exists but does not contain pinned commit $commit"
+        fi
+    else
+        rm -rf "$destination"
+
+        local temp_root
+        temp_root="$(mktemp -d "$KERNARIUM/.build/${name}-mirror.XXXXXX")"
+
+        echo "Mirror:"
+        echo "$mirror_url"
+
+        if ! git -C "$temp_root" init --quiet; then
+            rm -rf "$temp_root"
+            fail "Could not initialize temporary $name repository"
+        fi
+
+        git -C "$temp_root" remote add origin "$mirror_url"
+
+        if ! git -C "$temp_root" fetch \
+            --no-tags \
+            --depth 1 \
+            origin \
+            "$commit"; then
+
+            rm -rf "$temp_root"
+
+            fail \
+                "Could not fetch exact pinned $name commit $commit from mirror"
+        fi
+
+        local fetched_commit
+        fetched_commit="$(
+            git -C "$temp_root" rev-parse "$commit^{commit}"
+        )"
+
+        if [ "$fetched_commit" != "$commit" ]; then
+            rm -rf "$temp_root"
+            fail \
+                "$name mirror returned unexpected commit: $fetched_commit"
+        fi
+
+        git -C "$temp_root" checkout --quiet --detach "$commit"
+
+        # The dependency verifier requires a clean repository and no remote.
+        git -C "$temp_root" remote remove origin
+
+        mkdir -p "$(dirname "$destination")"
+
+        if ! mv "$temp_root" "$destination"; then
+            rm -rf "$temp_root"
+            fail "Could not publish $name source tree"
+        fi
     fi
-
-    rm -rf "$destination"
-
-    local temp_root
-    temp_root="$(mktemp -d "$KERNARIUM/.build/libiconv-source.XXXXXX")"
-
-    tar -xzf "$archive" -C "$temp_root"
-
-    local extracted
-    extracted="$(
-        find "$temp_root" \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -type d \
-            -name 'libiconv-*' \
-            -print \
-            -quit
-    )"
-
-    [ -n "$extracted" ] ||
-        fail "Could not locate extracted libiconv source directory"
-
-    mv "$extracted" "$destination"
-    rm -rf "$temp_root"
 
     cd "$destination"
 
-    git init --quiet
-    git add -A
-
-    GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" \
-    GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
-    GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" \
-    GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL" \
-        git commit \
-        --quiet \
-        --allow-empty \
-        -m "libiconv 1.18 official GNU source archive"
-
-    local generated_commit
-    generated_commit="$(git rev-parse HEAD)"
-
-    git config uml.source.repository \
-        "https://git.savannah.gnu.org/git/libiconv.git"
-
-    git config uml.source.commit "$generated_commit"
+    git config uml.source.repository "$upstream_url"
+    git config uml.source.commit "$commit"
     git config uml.source.paths "."
     git config uml.source.patchSeries "-"
 
     git remote remove origin 2>/dev/null || true
 
-    [ -z "$(git status --porcelain --untracked-files=all)" ] ||
-        fail "Materialized libiconv repository is dirty"
+    [ "$(git rev-parse "$commit^{commit}")" = "$commit" ] ||
+        fail "$name pinned commit verification failed"
 
-    printf '%s\n' "$generated_commit"
+    [ -z "$(git remote)" ] ||
+        fail "$name repository still contains a network remote"
+
+    [ -z "$(git status --porcelain --untracked-files=all)" ] ||
+        fail "$name repository is dirty"
+
+    echo
+    echo "Verified $name:"
+    echo "  upstream : $upstream_url"
+    echo "  commit   : $commit"
+
+    cd "$KERNARIUM"
 }
 
-patch_libiconv_manifest()
+###############################################################################
+# Savannah fallback
+###############################################################################
+
+materialize_gnulib_from_mirror()
 {
-    local manifest="$KERNARIUM/dependencies/manifest.tsv"
-    local commit="$1"
+    materialize_git_mirror \
+        "gnulib" \
+        "https://github.com/coreutils/gnulib.git" \
+        "https://git.savannah.gnu.org/git/gnulib.git" \
+        "2e8033f55cbe31f49db6e78f2b9d15f2677bde90" \
+        "$SOURCE_ROOT/gnulib"
+}
 
-    local temp_manifest
-    temp_manifest="$(mktemp "$KERNARIUM/.build/manifest.XXXXXX")"
-
-    awk -F '\t' -v OFS='\t' -v new_commit="$commit" '
-        $1 == "libiconv" {
-            $5 = new_commit
-            found = 1
-        }
-
-        {
-            print
-        }
-
-        END {
-            if (!found)
-                exit 1
-        }
-    ' "$manifest" > "$temp_manifest" || {
-        rm -f "$temp_manifest"
-        fail "Could not patch libiconv manifest"
-    }
-
-    mv "$temp_manifest" "$manifest"
+materialize_libiconv_from_mirror()
+{
+    materialize_git_mirror \
+        "libiconv" \
+        "https://github.com/autotools-mirror/libiconv.git" \
+        "https://git.savannah.gnu.org/git/libiconv.git" \
+        "ed5a57cfedda75a6abbe4d0fb89a6f7b832f073e" \
+        "$SOURCE_ROOT/libiconv"
 }
 
 ###############################################################################
@@ -278,42 +323,53 @@ set -e
 
 cat "$MACOS_PREPARE_LOG"
 
+###############################################################################
+# Recover network failures from Savannah
+###############################################################################
+
 if [ "$MACOS_PREPARE_STATUS" -ne 0 ]; then
 
+    GNULIB_FAILED=0
+    LIBICONV_FAILED=0
+
     if grep -Eq \
-        'libiconv\.git|libiconv.*Operation too slow|libiconv.*unable to access|libiconv.*Could not resolve' \
+        'gnulib\.git|gnulib.*Operation too slow|gnulib.*unable to access|gnulib.*Could not resolve|gnulib.*expected .packfile' \
         "$MACOS_PREPARE_LOG"; then
 
-        log "Recover libiconv from official GNU archive"
+        GNULIB_FAILED=1
+    fi
 
-        LIBICONV_ARCHIVE="$KERNARIUM/.build/dependency-cache/archives/libiconv-1.18.tar.gz"
+    if grep -Eq \
+        'libiconv\.git|libiconv.*Operation too slow|libiconv.*unable to access|libiconv.*Could not resolve|libiconv.*expected .packfile' \
+        "$MACOS_PREPARE_LOG"; then
 
-        if [ ! -f "$LIBICONV_ARCHIVE" ]; then
-            curl \
-                --fail \
-                --location \
-                --retry 5 \
-                --retry-delay 2 \
-                --connect-timeout 20 \
-                --max-time 300 \
-                --output "$LIBICONV_ARCHIVE" \
-                "https://ftp.gnu.org/gnu/libiconv/libiconv-1.18.tar.gz"
-        fi
+        LIBICONV_FAILED=1
+    fi
 
-        LIBICONV_COMMIT="$(
-            materialize_libiconv_git_repository \
-                "$LIBICONV_ARCHIVE" \
-                "$SOURCE_ROOT/libiconv"
-        )"
+    if [ "$GNULIB_FAILED" -eq 1 ]; then
 
-        patch_libiconv_manifest "$LIBICONV_COMMIT"
+        materialize_gnulib_from_mirror
+
+    fi
+
+    if [ "$LIBICONV_FAILED" -eq 1 ]; then
+
+        materialize_libiconv_from_mirror
+
+    fi
+
+    if [ "$GNULIB_FAILED" -eq 1 ] || [ "$LIBICONV_FAILED" -eq 1 ]; then
+
+        log "Retry macOS dependency preparation"
 
         run "$KERNARIUM/dependencies/prepare.sh" \
             --product macos \
             --root "$SOURCE_ROOT"
 
     else
+
         fail "macOS dependency preparation failed"
+
     fi
 fi
 
@@ -337,10 +393,12 @@ macos_repos=(
 )
 
 for repo in "${macos_repos[@]}"; do
+
     [ -d "$SOURCE_ROOT/$repo/.git" ] ||
         fail "macOS dependency source is missing: $repo"
 
     echo "OK: $repo"
+
 done
 
 run "$KERNARIUM/dependencies/prepare.sh" \
@@ -349,13 +407,7 @@ run "$KERNARIUM/dependencies/prepare.sh" \
     --verify
 
 ###############################################################################
-# BUILD HOST DEPENDENCY PREFIX
-#
-# This MUST happen.
-#
-# Kernarium's iOS CMake configuration still verifies the private dependency
-# prefix. The prefix is a macOS host prefix and therefore MUST keep its own
-# deployment target of 14.0.
+# Build host dependency prefix
 ###############################################################################
 
 log "Build Kernarium host dependency prefix"
@@ -411,10 +463,12 @@ gpu_repos=(
 )
 
 for repo in "${gpu_repos[@]}"; do
+
     [ -d "$SOURCE_ROOT/$repo/.git" ] ||
         fail "Apple GPU dependency source is missing: $repo"
 
     echo "OK: $repo"
+
 done
 
 ###############################################################################
@@ -474,15 +528,7 @@ echo "iOS deployment target:"
 echo "$IOS_VERSION"
 
 ###############################################################################
-# IMPORTANT
-#
-# The host prefix remains:
-#
-#   .build/dependencies/macos-arm64
-#
-# and MUST NOT be rebuilt as iOS 16.4.
-#
-# The iOS target itself is explicitly selected here.
+# Configure iOS
 ###############################################################################
 
 run cmake \
