@@ -23,12 +23,21 @@ jobs:
           sudo xcode-select -s /Applications/Xcode_16.4.app
           xcodebuild -version
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           brew install cmake ninja ccache python3 meson pkg-config
-          
-          python3 -m pip install --upgrade pip
-          python3 -m pip install PyYAML
+
+      - name: Create Python build environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/kernarium-venv"
+
+          "$RUNNER_TEMP/kernarium-venv/bin/python" \
+            -m pip install --upgrade pip
+
+          "$RUNNER_TEMP/kernarium-venv/bin/python" \
+            -m pip install PyYAML
+
+          echo "$RUNNER_TEMP/kernarium-venv/bin" >> "$GITHUB_PATH"
 
       - name: Verify build tools
         run: |
@@ -39,6 +48,14 @@ jobs:
           pkg-config --version
 
           python3 -c "import yaml; print('PyYAML:', yaml.__version__)"
+
+          echo
+          echo "Python:"
+          which python3
+
+          echo
+          echo "Meson:"
+          which meson
 
       - name: Fetch Kernarium
         run: |
