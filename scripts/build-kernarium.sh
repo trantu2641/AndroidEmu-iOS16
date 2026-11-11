@@ -1,4 +1,4 @@
-```bash
+
 #!/usr/bin/env bash
 
 set -euo pipefail
@@ -6,189 +6,143 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KERNARIUM="$ROOT/Kernarium"
 
-echo
-echo "========================================"
-echo " AndroidEmu iOS 16.4"
-echo " Build Kernarium"
-echo "========================================"
-echo
+BUILD_DIR="$KERNARIUM/.build/kernarium-ios16"
+GPU_PREFIX="$KERNARIUM/.build/dependencies/apple-gpu/ios-device-arm64"
 
-cd "$KERNARIUM"
+IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+IOS_CC="$(xcrun --sdk iphoneos -f clang)"
+IOS_CXX="$(xcrun --sdk iphoneos -f clang++)"
 
-# ==================================================
-# 1. Git identity
-# ==================================================
+CPU_COUNT="$(sysctl -n hw.ncpu)"
 
-echo "==> Configuring Git identity..."
+section()
+{
+    echo
+    echo "========================================"
+    echo "$1"
+    echo "========================================"
+    echo
+}
+
+fail()
+{
+    echo
+    echo "ERROR: $1"
+    exit 1
+}
+
+section "Checking environment"
+
+if [ ! -d "$KERNARIUM" ]; then
+    fail "Kernarium directory not found: $KERNARIUM"
+fi
+
+if [ "$(uname -s)" != "Darwin" ]; then
+    fail "This build must run on macOS."
+fi
+
+if [ "$(uname -m)" != "arm64" ]; then
+    fail "Kernarium Apple GPU build requires an arm64 macOS runner."
+fi
+
+if ! command -v xcodebuild >/dev/null 2>&1; then
+    fail "xcodebuild not found."
+fi
+
+if ! command -v xcrun >/dev/null 2>&1; then
+    fail "xcrun not found."
+fi
+
+if ! command -v cmake >/dev/null 2>&1; then
+    fail "cmake not found."
+fi
+
+echo "macOS      : $(sw_vers -productVersion)"
+echo "Xcode      : $(xcodebuild -version | head -1)"
+echo "iOS SDK    : $IOS_SDK"
+echo "CPU cores  : $CPU_COUNT"
+echo "Kernarium  : $KERNARIUM"
+
+section "Configure Git identity"
 
 git config user.name "AndroidEmu Builder"
 git config user.email "androidemu-builder@localhost"
 
-echo "Git user:"
-git config user.name
-git config user.email
+echo "Git user : $(git config user.name)"
+echo "Git email: $(git config user.email)"
 
-# ==================================================
-# 2. Host check
-# ==================================================
+section "Prepare Kernarium dependencies"
 
-echo
-echo "==> Checking host..."
+cd "$KERNARIUM"
 
-ARCH="$(uname -m)"
+DEPENDENCY_ROOT="$KERNARIUM/external/sources"
 
-echo "Architecture: $ARCH"
+echo "Preparing dependency source trees:"
+echo "$DEPENDENCY_ROOT"
 
-if [ "$ARCH" != "arm64" ]; then
-    echo
-    echo "ERROR: Apple GPU dependency build requires arm64 macOS."
-    exit 1
+mkdir -p "$DEPENDENCY_ROOT"
+
+#
+# IMPORTANT:
+#
+# dependencies/build-apple-gpu.sh calls prepare.sh with --verify.
+# Therefore the dependency sources MUST be materialized first.
+#
+"$KERNARIUM/dependencies/prepare.sh" \
+    --product apple-gpu \
+    --root "$DEPENDENCY_ROOT"
+
+if [ ! -d "$DEPENDENCY_ROOT" ]; then
+    fail "Dependency source root was not created."
 fi
 
-# ==================================================
-# 3. Xcode
-# ==================================================
-
 echo
-echo "==> Checking Xcode..."
+echo "Prepared dependency sources:"
+find "$DEPENDENCY_ROOT" -mindepth 1 -maxdepth 1 -type d \
+    -print | sort
 
-xcodebuild -version
-
-echo
-echo "iOS SDK:"
-xcrun --sdk iphoneos --show-sdk-version
-
-echo
-echo "iOS SDK path:"
-xcrun --sdk iphoneos --show-sdk-path
-
-# ==================================================
-# 4. Apple GPU dependency
-# ==================================================
-
-echo
-echo "========================================"
-echo "==> Building Apple GPU dependency"
-echo "========================================"
-echo
+section "Build Apple GPU dependency"
 
 GPU_SCRIPT="$KERNARIUM/dependencies/build-apple-gpu.sh"
 
 if [ ! -f "$GPU_SCRIPT" ]; then
-    echo
-    echo "ERROR:"
-    echo "Apple GPU dependency script not found:"
-    echo "$GPU_SCRIPT"
-    exit 1
+    fail "Apple GPU build script not found: $GPU_SCRIPT"
 fi
 
-chmod +x "$GPU_SCRIPT"
+echo "Building:"
+echo "  platform : ios"
+echo "  product  : apple-gpu"
+echo "  jobs     : $CPU_COUNT"
+echo "  prefix   : $GPU_PREFIX"
 
 "$GPU_SCRIPT" \
     --platform ios \
-    --jobs "$(sysctl -n hw.ncpu)"
+    --product apple-gpu \
+    --source-root "$DEPENDENCY_ROOT" \
+    --prefix "$GPU_PREFIX" \
+    --jobs "$CPU_COUNT"
 
-# ==================================================
-# 5. Verify GPU dependency
-# ==================================================
-
-echo
-echo "========================================"
-echo "==> Verifying Apple GPU dependency"
-echo "========================================"
-echo
-
-GPU_PREFIX="$KERNARIUM/.build/dependencies/apple-gpu/ios-device-arm64"
+section "Verify Apple GPU dependency"
 
 EPOXY="$GPU_PREFIX/lib/libepoxy.a"
 VIRGL="$GPU_PREFIX/lib/libvirglrenderer.a"
 
 if [ ! -f "$EPOXY" ]; then
-    echo
-    echo "ERROR: libepoxy.a was not produced."
-    echo
-    echo "Expected:"
-    echo "$EPOXY"
-    exit 1
+    fail "Missing libepoxy.a: $EPOXY"
 fi
 
 if [ ! -f "$VIRGL" ]; then
-    echo
-    echo "ERROR: libvirglrenderer.a was not produced."
-    echo
-    echo "Expected:"
-    echo "$VIRGL"
-    exit 1
+    fail "Missing libvirglrenderer.a: $VIRGL"
 fi
 
-if [ ! -d "$GPU_PREFIX/include" ]; then
-    echo
-    echo "ERROR: GPU include directory was not produced."
-    exit 1
-fi
+echo "OK: $EPOXY"
+echo "OK: $VIRGL"
 
-echo "Apple GPU dependency OK."
-echo
-echo "libepoxy:"
-ls -lh "$EPOXY"
-
-echo
-echo "libvirglrenderer:"
-ls -lh "$VIRGL"
-
-# ==================================================
-# 6. Detect CMake
-# ==================================================
-
-echo
-echo "========================================"
-echo "==> Detecting CMake configuration"
-echo "========================================"
-echo
-
-if [ -f "$KERNARIUM/CMakePresets.json" ]; then
-
-    echo "CMakePresets.json found."
-
-    echo
-    echo "Available presets:"
-    cmake --list-presets 2>&1 || true
-
-else
-
-    echo "No CMakePresets.json found."
-    echo "Using direct CMake configuration."
-
-fi
-
-# ==================================================
-# 7. Configure
-# ==================================================
-
-echo
-echo "========================================"
-echo "==> Configuring Kernarium"
-echo "========================================"
-echo
-
-BUILD_DIR="$KERNARIUM/.build/androidemu-ios16"
+section "Configure Kernarium"
 
 rm -rf "$BUILD_DIR"
+
 mkdir -p "$BUILD_DIR"
-
-IOS_CC="$(xcrun --sdk iphoneos --find clang)"
-IOS_CXX="$(xcrun --sdk iphoneos --find clang++)"
-
-echo "C compiler:"
-echo "$IOS_CC"
-
-echo
-echo "C++ compiler:"
-echo "$IOS_CXX"
-
-echo
-echo "Build directory:"
-echo "$BUILD_DIR"
 
 cmake \
     -S "$KERNARIUM" \
@@ -200,37 +154,21 @@ cmake \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER="$IOS_CC" \
     -DCMAKE_CXX_COMPILER="$IOS_CXX" \
-    -DCMAKE_OBJCXX_COMPILER="$IOS_CXX"
+    -DCMAKE_OBJCXX_COMPILER="$IOS_CXX" \
+    -DAPPLE_GPU_PREFIX="$GPU_PREFIX"
 
-# ==================================================
-# 8. Build
-# ==================================================
-
-echo
-echo "========================================"
-echo "==> Building Kernarium"
-echo "========================================"
-echo
+section "Build Kernarium"
 
 cmake \
     --build "$BUILD_DIR" \
-    --parallel "$(sysctl -n hw.ncpu)"
+    --parallel "$CPU_COUNT"
 
-# ==================================================
-# 9. Result
-# ==================================================
-
-echo
-echo "========================================"
-echo " Kernarium build completed"
-echo "========================================"
-echo
+section "Build output"
 
 echo "Build directory:"
 echo "$BUILD_DIR"
 
 echo
-echo "Produced files:"
 
 find "$BUILD_DIR" \
     -type f \
@@ -240,12 +178,14 @@ find "$BUILD_DIR" \
         -o -name "*.framework" \
         -o -name "*.bin" \
         -o -name "*.img" \
+        -o -name "*.o" \
     \) \
     -print \
-    2>/dev/null || true
+    | sort
 
+section "Kernarium build finished"
+
+echo "Kernarium iOS 16.4 build completed."
 echo
-echo "========================================"
-echo " DONE"
-echo "========================================"
-```
+echo "Build directory:"
+echo "$BUILD_DIR"
