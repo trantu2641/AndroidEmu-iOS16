@@ -178,14 +178,18 @@ fi
 log "Prepare dependency source root"
 
 mkdir -p "$SOURCE_ROOT"
+mkdir -p "$KERNARIUM/.build/dependency-cache/archives"
 
 echo "Dependency source root:"
 echo "$SOURCE_ROOT"
 
 ###############################################################################
 # Helper:
-# Convert the official libiconv source archive into a prepared local Git
-# repository compatible with Kernarium's dependency verifier.
+# Convert official libiconv archive into a prepared local Git repository.
+#
+# IMPORTANT:
+# All diagnostic output goes to stderr.
+# stdout contains ONLY the generated Git commit.
 ###############################################################################
 
 materialize_libiconv_git_repository()
@@ -196,22 +200,22 @@ materialize_libiconv_git_repository()
 
     local expected_sha256="3b08f5f4f9b4eb82f151a7040bfd6fe6c6fb922efe4b1659c66ea933276965e8"
 
-    echo
-    echo "========================================"
-    echo "Materialize libiconv Git source"
-    echo "========================================"
+    echo >&2
+    echo "========================================" >&2
+    echo "Materialize libiconv Git source" >&2
+    echo "========================================" >&2
 
     [ -f "$archive" ] || fail "libiconv archive is missing: $archive"
 
     local actual_sha256
     actual_sha256="$(shasum -a 256 "$archive" | awk '{print $1}')"
 
-    echo "Expected archive SHA256:"
-    echo "$expected_sha256"
+    echo "Expected archive SHA256:" >&2
+    echo "$expected_sha256" >&2
 
-    echo
-    echo "Actual archive SHA256:"
-    echo "$actual_sha256"
+    echo >&2
+    echo "Actual archive SHA256:" >&2
+    echo "$actual_sha256" >&2
 
     if [ "$actual_sha256" != "$expected_sha256" ]; then
         fail "libiconv archive SHA256 mismatch"
@@ -222,23 +226,26 @@ materialize_libiconv_git_repository()
     local temp_root
     temp_root="$(mktemp -d "$KERNARIUM/.build/libiconv-source.XXXXXX")"
 
-    cleanup_libiconv()
-    {
-        rm -rf "$temp_root"
-    }
-
-    trap cleanup_libiconv RETURN
-
     tar -xzf "$archive" -C "$temp_root"
 
     local extracted
-    extracted="$(find "$temp_root" -mindepth 1 -maxdepth 1 -type d -name 'libiconv-*' -print -quit)"
+    extracted="$(
+        find "$temp_root" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -name 'libiconv-*' \
+            -print \
+            -quit
+    )"
 
     if [ -z "$extracted" ]; then
+        rm -rf "$temp_root"
         fail "Could not locate extracted libiconv source directory"
     fi
 
     mv "$extracted" "$destination"
+    rm -rf "$temp_root"
 
     cd "$destination"
 
@@ -263,32 +270,30 @@ materialize_libiconv_git_repository()
     git config uml.source.paths "."
     git config uml.source.patchSeries "-"
 
-    # Kernarium requires prepared repositories to have no remote.
     git remote remove origin 2>/dev/null || true
 
-    # Make sure the prepared tree is completely clean.
     if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
         fail "Materialized libiconv repository is dirty"
     fi
 
-    echo
-    echo "Prepared libiconv Git repository:"
-    echo "$destination"
+    echo >&2
+    echo "Prepared libiconv Git repository:" >&2
+    echo "$destination" >&2
 
-    echo
-    echo "Generated local commit:"
-    echo "$generated_commit"
+    echo >&2
+    echo "Generated local commit:" >&2
+    echo "$generated_commit" >&2
 
-    echo
-    echo "Archive identity:"
-    echo "$actual_sha256"
+    echo >&2
+    echo "Archive identity:" >&2
+    echo "$actual_sha256" >&2
 
+    # stdout MUST contain only the commit.
     printf '%s\n' "$generated_commit"
 }
 
 ###############################################################################
-# Patch the manifest so the archive-backed libiconv source has the local
-# prepared Git commit identity expected by prepare.sh/build.sh.
+# Patch libiconv manifest
 ###############################################################################
 
 patch_libiconv_manifest()
@@ -298,18 +303,26 @@ patch_libiconv_manifest()
 
     [ -f "$manifest" ] || fail "Dependency manifest not found: $manifest"
 
+    if [[ "$commit" =~ [^0-9a-f] ]] || [ "${#commit}" -ne 40 ]; then
+        fail "Invalid libiconv Git commit received: '$commit'"
+    fi
+
     local temp_manifest
     temp_manifest="$(mktemp "$KERNARIUM/.build/manifest.XXXXXX")"
 
     awk -F '\t' -v OFS='\t' -v new_commit="$commit" '
-        BEGIN { found=0 }
+        BEGIN {
+            found = 0
+        }
 
         $1 == "libiconv" {
             $5 = new_commit
-            found=1
+            found = 1
         }
 
-        { print }
+        {
+            print
+        }
 
         END {
             if (!found) {
@@ -333,8 +346,6 @@ patch_libiconv_manifest()
 ###############################################################################
 
 log "Prepare standard macOS dependencies"
-
-mkdir -p "$KERNARIUM/.build/dependency-cache/archives"
 
 MACOS_PREPARE_LOG="$KERNARIUM/.build/macos-prepare.log"
 
@@ -361,7 +372,8 @@ else
     echo
     echo "WARNING: standard macOS dependency preparation failed."
 
-    if grep -q "libiconv.git" "$MACOS_PREPARE_LOG"; then
+    if grep -Eq 'libiconv\.git|libiconv.*Operation too slow|libiconv.*Could not resolve|libiconv.*unable to access' \
+        "$MACOS_PREPARE_LOG"; then
 
         echo
         echo "========================================"
@@ -375,6 +387,7 @@ else
         LIBICONV_SHA256="3b08f5f4f9b4eb82f151a7040bfd6fe6c6fb922efe4b1659c66ea933276965e8"
 
         if [ ! -f "$LIBICONV_ARCHIVE" ]; then
+
             echo
             echo "Downloading official GNU libiconv 1.18 archive..."
 
@@ -389,13 +402,19 @@ else
                 --max-time 300 \
                 --output "$LIBICONV_ARCHIVE" \
                 "$LIBICONV_URL"
+
         else
+
             echo
             echo "Using cached libiconv archive:"
             echo "$LIBICONV_ARCHIVE"
+
         fi
 
-        ACTUAL_SHA256="$(shasum -a 256 "$LIBICONV_ARCHIVE" | awk '{print $1}')"
+        ACTUAL_SHA256="$(
+            shasum -a 256 "$LIBICONV_ARCHIVE" |
+                awk '{print $1}'
+        )"
 
         echo
         echo "Expected SHA256:"
@@ -409,11 +428,21 @@ else
             fail "libiconv archive SHA256 mismatch"
         fi
 
+        # The function prints ONLY the commit to stdout.
         LIBICONV_COMMIT="$(
             materialize_libiconv_git_repository \
                 "$LIBICONV_ARCHIVE" \
                 "$SOURCE_ROOT/libiconv"
         )"
+
+        echo
+        echo "Captured libiconv commit:"
+        echo "$LIBICONV_COMMIT"
+
+        # Safety check before touching manifest.
+        if ! [[ "$LIBICONV_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            fail "libiconv commit capture is invalid: '$LIBICONV_COMMIT'"
+        fi
 
         patch_libiconv_manifest "$LIBICONV_COMMIT"
 
@@ -433,11 +462,12 @@ else
         cat "$MACOS_PREPARE_LOG"
 
         fail "macOS dependency preparation failed for a reason other than libiconv"
+
     fi
 fi
 
 ###############################################################################
-# Verify all macOS dependencies
+# Verify prepared macOS dependency repositories
 ###############################################################################
 
 log "Verify prepared macOS dependency repositories"
@@ -453,7 +483,6 @@ macos_repos=(
     gvdb
     libslirp
     libvncserver
-    fex
 )
 
 for repo in "${macos_repos[@]}"; do
@@ -470,8 +499,7 @@ done
 # Verify using Kernarium's own verifier
 ###############################################################################
 
-echo
-echo "Running Kernarium dependency verifier..."
+log "Verify macOS dependency repositories"
 
 run "$KERNARIUM/dependencies/prepare.sh" \
     --product macos \
