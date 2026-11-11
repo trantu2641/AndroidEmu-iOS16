@@ -202,16 +202,27 @@ echo "========================================"
 # Keep the real prefix intact and expose the expected path as a symlink.
 #
 
+echo
+echo "========================================"
+echo "Prepare Kernarium host dependency prefix"
+echo "========================================"
+
 EXPECTED_MACOS_PREFIX="$DEPENDENCY_PREFIX_ROOT/macos-arm64"
 
-if [ -L "$EXPECTED_MACOS_PREFIX" ] || [ -e "$EXPECTED_MACOS_PREFIX" ]; then
-    rm -rf "$EXPECTED_MACOS_PREFIX"
-fi
+rm -rf "$EXPECTED_MACOS_PREFIX"
 
-ln -s "$MACOS_PREFIX" "$EXPECTED_MACOS_PREFIX"
+mkdir -p "$EXPECTED_MACOS_PREFIX"
 
-echo "macOS compatibility prefix:"
-ls -ld "$EXPECTED_MACOS_PREFIX"
+cp -R "$MACOS_PREFIX/." "$EXPECTED_MACOS_PREFIX/"
+
+echo "macOS dependency prefix copied:"
+du -sh "$EXPECTED_MACOS_PREFIX"
+
+echo "libepoxy:"
+ls -lh "$EXPECTED_MACOS_PREFIX/lib/libepoxy.a"
+
+echo "libvirglrenderer:"
+ls -lh "$EXPECTED_MACOS_PREFIX/lib/libvirglrenderer.a"
 
 echo
 echo "========================================"
