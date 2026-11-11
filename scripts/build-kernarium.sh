@@ -14,6 +14,10 @@ HOST_WORK_ROOT="$KERNARIUM/.build/dependency-build"
 
 IOS_GPU_PREFIX="$KERNARIUM/.build/dependencies/apple-gpu/ios-device-arm64"
 
+KERNEL_ARTIFACT_ROOT="$KERNARIUM/.build/kernel/artifacts"
+KERNEL_ARTIFACT_NAME="android-6.18-arm64-16k-20260906-main-integration-14163bda"
+KERNEL_ARTIFACT_DIR="$KERNEL_ARTIFACT_ROOT/$KERNEL_ARTIFACT_NAME"
+
 CPU_CORES="$(sysctl -n hw.ncpu)"
 
 log()
@@ -46,8 +50,6 @@ log "Checking environment"
 
 echo "macOS       : $(sw_vers -productVersion)"
 
-# Không dùng pipe xcodebuild | head.
-# Xcode 16.4 đôi khi crash Broken pipe khi head đóng stdout quá sớm.
 XCODE_VERSION="$(xcodebuild -version 2>/dev/null || true)"
 echo "Xcode       : $(printf '%s\n' "$XCODE_VERSION" | sed -n '1p')"
 
@@ -149,6 +151,59 @@ fi
 echo "Android AOSP 17: OK"
 
 ###############################################################################
+# Kernel artifact
+###############################################################################
+
+log "Verify Android 17 kernel artifact"
+
+mkdir -p "$KERNEL_ARTIFACT_ROOT"
+
+echo "Required artifact:"
+echo "$KERNEL_ARTIFACT_DIR"
+
+if [ ! -d "$KERNEL_ARTIFACT_DIR" ]; then
+    fail 
+        "Android 17 kernel artifact is missing.
+
+Expected:
+$KERNEL_ARTIFACT_DIR
+
+The artifact must be the real accepted Kernarium Android 17
+ACK 6.18 arm64 16 KiB artifact.
+
+Do NOT create an empty directory or copy a random vmlinux."
+fi
+
+[ -d "$KERNEL_ARTIFACT_DIR" ] ||
+    fail "Kernel artifact root is not a directory"
+
+[ -f "$KERNEL_ARTIFACT_DIR/kernel-artifact.json" ] ||
+    fail "Missing kernel-artifact.json"
+
+[ -f "$KERNEL_ARTIFACT_DIR/kernel/vmlinux" ] ||
+    fail "Missing kernel/vmlinux"
+
+[ -f "$KERNEL_ARTIFACT_DIR/kernel/config" ] ||
+    fail "Missing kernel/config"
+
+[ -f "$KERNEL_ARTIFACT_DIR/kernel/kernel.release" ] ||
+    fail "Missing kernel/kernel.release"
+
+[ -f "$KERNEL_ARTIFACT_DIR/kernel/modules.builtin" ] ||
+    fail "Missing kernel/modules.builtin"
+
+[ -f "$KERNEL_ARTIFACT_DIR/kernel/modules.builtin.modinfo" ] ||
+    fail "Missing kernel/modules.builtin.modinfo"
+
+echo
+echo "Kernel artifact files:"
+find "$KERNEL_ARTIFACT_DIR" -maxdepth 3 -type f -print | sort
+
+echo
+echo "Kernel artifact metadata:"
+cat "$KERNEL_ARTIFACT_DIR/kernel-artifact.json"
+
+###############################################################################
 # Dependency source root
 ###############################################################################
 
@@ -160,149 +215,6 @@ mkdir -p "$KERNARIUM/.build/dependency-cache/git"
 mkdir -p "$KERNARIUM/.build/dependency-cache/archives"
 
 ###############################################################################
-# Materialize a pinned dependency from a GitHub mirror
-#
-# Important:
-#
-# The upstream identity remains the URL from Kernarium's manifest.
-# We only use GitHub as the transport source.
-#
-# After materialization:
-#   - exact pinned commit exists
-#   - no network remote remains
-#   - uml.source.repository = original upstream URL
-#   - uml.source.commit = exact pinned upstream commit
-#   - uml.source.paths = .
-#   - uml.source.patchSeries = -
-#
-# This satisfies Kernarium's verify_repository() rules without inventing
-# another commit or changing the dependency manifest.
-###############################################################################
-
-materialize_git_mirror()
-{
-    local name="$1"
-    local mirror_url="$2"
-    local upstream_url="$3"
-    local commit="$4"
-    local destination="$5"
-
-    log "Materialize $name from GitHub mirror"
-
-    if [ -d "$destination/.git" ]; then
-        echo "$name source already exists"
-
-        local existing_commit
-        existing_commit="$(git -C "$destination" rev-parse "$commit^{commit}" 2>/dev/null || true)"
-
-        if [ "$existing_commit" = "$commit" ]; then
-            echo "Pinned commit already exists: $commit"
-        else
-            fail "$name exists but does not contain pinned commit $commit"
-        fi
-    else
-        rm -rf "$destination"
-
-        local temp_root
-        temp_root="$(mktemp -d "$KERNARIUM/.build/${name}-mirror.XXXXXX")"
-
-        echo "Mirror:"
-        echo "$mirror_url"
-
-        if ! git -C "$temp_root" init --quiet; then
-            rm -rf "$temp_root"
-            fail "Could not initialize temporary $name repository"
-        fi
-
-        git -C "$temp_root" remote add origin "$mirror_url"
-
-        if ! git -C "$temp_root" fetch \
-            --no-tags \
-            --depth 1 \
-            origin \
-            "$commit"; then
-
-            rm -rf "$temp_root"
-
-            fail \
-                "Could not fetch exact pinned $name commit $commit from mirror"
-        fi
-
-        local fetched_commit
-        fetched_commit="$(
-            git -C "$temp_root" rev-parse "$commit^{commit}"
-        )"
-
-        if [ "$fetched_commit" != "$commit" ]; then
-            rm -rf "$temp_root"
-            fail \
-                "$name mirror returned unexpected commit: $fetched_commit"
-        fi
-
-        git -C "$temp_root" checkout --quiet --detach "$commit"
-
-        # The dependency verifier requires a clean repository and no remote.
-        git -C "$temp_root" remote remove origin
-
-        mkdir -p "$(dirname "$destination")"
-
-        if ! mv "$temp_root" "$destination"; then
-            rm -rf "$temp_root"
-            fail "Could not publish $name source tree"
-        fi
-    fi
-
-    cd "$destination"
-
-    git config uml.source.repository "$upstream_url"
-    git config uml.source.commit "$commit"
-    git config uml.source.paths "."
-    git config uml.source.patchSeries "-"
-
-    git remote remove origin 2>/dev/null || true
-
-    [ "$(git rev-parse "$commit^{commit}")" = "$commit" ] ||
-        fail "$name pinned commit verification failed"
-
-    [ -z "$(git remote)" ] ||
-        fail "$name repository still contains a network remote"
-
-    [ -z "$(git status --porcelain --untracked-files=all)" ] ||
-        fail "$name repository is dirty"
-
-    echo
-    echo "Verified $name:"
-    echo "  upstream : $upstream_url"
-    echo "  commit   : $commit"
-
-    cd "$KERNARIUM"
-}
-
-###############################################################################
-# Savannah fallback
-###############################################################################
-
-materialize_gnulib_from_mirror()
-{
-    materialize_git_mirror \
-        "gnulib" \
-        "https://github.com/coreutils/gnulib.git" \
-        "https://git.savannah.gnu.org/git/gnulib.git" \
-        "2e8033f55cbe31f49db6e78f2b9d15f2677bde90" \
-        "$SOURCE_ROOT/gnulib"
-}
-
-materialize_libiconv_from_mirror()
-{
-    materialize_git_mirror \
-        "libiconv" \
-        "https://github.com/autotools-mirror/libiconv.git" \
-        "https://git.savannah.gnu.org/git/libiconv.git" \
-        "ed5a57cfedda75a6abbe4d0fb89a6f7b832f073e" \
-        "$SOURCE_ROOT/libiconv"
-}
-
-###############################################################################
 # Prepare macOS dependency sources
 ###############################################################################
 
@@ -312,9 +224,9 @@ MACOS_PREPARE_LOG="$KERNARIUM/.build/macos-prepare.log"
 
 set +e
 
-"$KERNARIUM/dependencies/prepare.sh" \
-    --product macos \
-    --root "$SOURCE_ROOT" \
+"$KERNARIUM/dependencies/prepare.sh" 
+    --product macos 
+    --root "$SOURCE_ROOT" 
     >"$MACOS_PREPARE_LOG" 2>&1
 
 MACOS_PREPARE_STATUS=$?
@@ -324,58 +236,12 @@ set -e
 cat "$MACOS_PREPARE_LOG"
 
 ###############################################################################
-# Recover network failures from Savannah
+# Verify macOS dependency repositories
 ###############################################################################
 
 if [ "$MACOS_PREPARE_STATUS" -ne 0 ]; then
-
-    GNULIB_FAILED=0
-    LIBICONV_FAILED=0
-
-    if grep -Eq \
-        'gnulib\.git|gnulib.*Operation too slow|gnulib.*unable to access|gnulib.*Could not resolve|gnulib.*expected .packfile' \
-        "$MACOS_PREPARE_LOG"; then
-
-        GNULIB_FAILED=1
-    fi
-
-    if grep -Eq \
-        'libiconv\.git|libiconv.*Operation too slow|libiconv.*unable to access|libiconv.*Could not resolve|libiconv.*expected .packfile' \
-        "$MACOS_PREPARE_LOG"; then
-
-        LIBICONV_FAILED=1
-    fi
-
-    if [ "$GNULIB_FAILED" -eq 1 ]; then
-
-        materialize_gnulib_from_mirror
-
-    fi
-
-    if [ "$LIBICONV_FAILED" -eq 1 ]; then
-
-        materialize_libiconv_from_mirror
-
-    fi
-
-    if [ "$GNULIB_FAILED" -eq 1 ] || [ "$LIBICONV_FAILED" -eq 1 ]; then
-
-        log "Retry macOS dependency preparation"
-
-        run "$KERNARIUM/dependencies/prepare.sh" \
-            --product macos \
-            --root "$SOURCE_ROOT"
-
-    else
-
-        fail "macOS dependency preparation failed"
-
-    fi
+    fail "macOS dependency preparation failed"
 fi
-
-###############################################################################
-# Verify macOS source repositories
-###############################################################################
 
 log "Verify prepared macOS dependency repositories"
 
@@ -393,17 +259,15 @@ macos_repos=(
 )
 
 for repo in "${macos_repos[@]}"; do
-
     [ -d "$SOURCE_ROOT/$repo/.git" ] ||
         fail "macOS dependency source is missing: $repo"
 
     echo "OK: $repo"
-
 done
 
-run "$KERNARIUM/dependencies/prepare.sh" \
-    --product macos \
-    --root "$SOURCE_ROOT" \
+run "$KERNARIUM/dependencies/prepare.sh" 
+    --product macos 
+    --root "$SOURCE_ROOT" 
     --verify
 
 ###############################################################################
@@ -416,20 +280,20 @@ export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
 
 echo "Host deployment target: $MACOSX_DEPLOYMENT_TARGET"
 
-run env \
-    MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
-    UML_DEPENDENCY_SOURCE_ROOT="$SOURCE_ROOT" \
-    UML_DEPENDENCY_PREFIX="$HOST_PREFIX" \
-    UML_DEPENDENCY_BUILD_ROOT="$HOST_WORK_ROOT" \
-    UML_DEPENDENCY_JOBS="$CPU_CORES" \
-    "$KERNARIUM/dependencies/build.sh" \
-    --source-root "$SOURCE_ROOT" \
-    --prefix "$HOST_PREFIX" \
-    --work-root "$HOST_WORK_ROOT" \
+run env 
+    MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" 
+    UML_DEPENDENCY_SOURCE_ROOT="$SOURCE_ROOT" 
+    UML_DEPENDENCY_PREFIX="$HOST_PREFIX" 
+    UML_DEPENDENCY_BUILD_ROOT="$HOST_WORK_ROOT" 
+    UML_DEPENDENCY_JOBS="$CPU_CORES" 
+    "$KERNARIUM/dependencies/build.sh" 
+    --source-root "$SOURCE_ROOT" 
+    --prefix "$HOST_PREFIX" 
+    --work-root "$HOST_WORK_ROOT" 
     --jobs "$CPU_CORES"
 
 ###############################################################################
-# Verify host prefix
+# Verify host dependency prefix
 ###############################################################################
 
 log "Verify host dependency prefix"
@@ -452,8 +316,8 @@ cat "$HOST_RECEIPT"
 
 log "Prepare Apple GPU dependency sources"
 
-run "$KERNARIUM/dependencies/prepare.sh" \
-    --product apple-gpu \
+run "$KERNARIUM/dependencies/prepare.sh" 
+    --product apple-gpu 
     --root "$SOURCE_ROOT"
 
 gpu_repos=(
@@ -463,12 +327,10 @@ gpu_repos=(
 )
 
 for repo in "${gpu_repos[@]}"; do
-
     [ -d "$SOURCE_ROOT/$repo/.git" ] ||
         fail "Apple GPU dependency source is missing: $repo"
 
     echo "OK: $repo"
-
 done
 
 ###############################################################################
@@ -477,7 +339,7 @@ done
 
 log "Build Apple GPU dependencies for iOS"
 
-run "$KERNARIUM/dependencies/build-apple-gpu.sh" \
+run "$KERNARIUM/dependencies/build-apple-gpu.sh" 
     --platform ios
 
 ###############################################################################
@@ -498,8 +360,8 @@ IOS_VIRGL="$IOS_GPU_PREFIX/lib/libvirglrenderer.a"
 [ -f "$IOS_VIRGL" ] ||
     fail "Missing iOS libvirglrenderer.a: $IOS_VIRGL"
 
-ls -lh \
-    "$IOS_EPOXY" \
+ls -lh 
+    "$IOS_EPOXY" 
     "$IOS_VIRGL"
 
 ###############################################################################
@@ -527,30 +389,37 @@ echo
 echo "iOS deployment target:"
 echo "$IOS_VERSION"
 
+echo
+echo "Kernel artifact:"
+echo "$KERNEL_ARTIFACT_DIR"
+
 ###############################################################################
 # Configure iOS
 ###############################################################################
 
-run cmake \
-    -S "$KERNARIUM" \
-    -B "$BUILD_DIR" \
-    -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_SYSTEM_NAME=iOS \
-    -DCMAKE_OSX_SYSROOT="$IOS_SDK" \
-    -DCMAKE_OSX_ARCHITECTURES="$ARCH" \
-    -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_VERSION" \
-    -DCMAKE_C_COMPILER="$IOS_CLANG" \
-    -DCMAKE_CXX_COMPILER="$IOS_CLANGXX" \
-    -DUML_APPLE_PLATFORM=ios \
-    -DUML_BUILD_CLI=OFF \
-    -DUML_BUILD_ANDROID17_CLI=OFF \
-    -DUML_BUILD_GPU=OFF \
-    -DUML_BUILD_AUDIO=OFF \
-    -DUML_BUILD_NETWORK_PROVIDER=OFF \
-    -DUML_BUILD_KERNARIUM_RUNTIME=ON \
-    -DUML_BUILD_UNIT_TESTS=OFF \
-    -DUML_BUILD_INTEGRATION_TESTS=OFF \
+run cmake 
+    -S "$KERNARIUM" 
+    -B "$BUILD_DIR" 
+    -G Ninja 
+    -DCMAKE_BUILD_TYPE=Release 
+    -DCMAKE_SYSTEM_NAME=iOS 
+    -DCMAKE_OSX_SYSROOT="$IOS_SDK" 
+    -DCMAKE_OSX_ARCHITECTURES="$ARCH" 
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_VERSION" 
+    -DCMAKE_C_COMPILER="$IOS_CLANG" 
+    -DCMAKE_CXX_COMPILER="$IOS_CLANGXX" 
+    -DUML_APPLE_PLATFORM=ios 
+    -DUML_KERNEL_PRODUCT=android-17 
+    -DUML_KERNEL_ARTIFACT_DIR="$KERNEL_ARTIFACT_DIR" 
+    -DUML_GUEST_16K_PAGES=ON 
+    -DUML_BUILD_CLI=OFF 
+    -DUML_BUILD_ANDROID17_CLI=OFF 
+    -DUML_BUILD_GPU=OFF 
+    -DUML_BUILD_AUDIO=OFF 
+    -DUML_BUILD_NETWORK_PROVIDER=OFF 
+    -DUML_BUILD_KERNARIUM_RUNTIME=ON 
+    -DUML_BUILD_UNIT_TESTS=OFF 
+    -DUML_BUILD_INTEGRATION_TESTS=OFF 
     -DUML_BUILD_TOOLING_TESTS=OFF
 
 ###############################################################################
@@ -559,8 +428,8 @@ run cmake \
 
 log "Build Kernarium"
 
-run cmake \
-    --build "$BUILD_DIR" \
+run cmake 
+    --build "$BUILD_DIR" 
     --parallel "$CPU_CORES"
 
 ###############################################################################
@@ -573,8 +442,8 @@ INSTALL_PREFIX="$KERNARIUM/.build/install-ios"
 
 rm -rf "$INSTALL_PREFIX"
 
-run cmake \
-    --install "$BUILD_DIR" \
+run cmake 
+    --install "$BUILD_DIR" 
     --prefix "$INSTALL_PREFIX"
 
 ###############################################################################
@@ -591,12 +460,11 @@ echo
 echo "Install directory:"
 echo "$INSTALL_PREFIX"
 
-find "$INSTALL_PREFIX" \
-    -maxdepth 5 \
-    -type f \
-    -print \
-    | sort \
-    | head -300
+find "$INSTALL_PREFIX" 
+    -maxdepth 5 
+    -type f 
+    -print 
+    | sort
 
 echo
 echo "========================================"
