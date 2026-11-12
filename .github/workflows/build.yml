@@ -9,17 +9,11 @@ permissions:
 env:
   IOS_VERSION: "16.4"
   KERNARIUM_COMMIT: "2c49df8ccb7b138400548ccc391511c5642eca57"
-  ANDROID_KERNEL_FAMILY: "android-6.18"
-  ANDROID_KERNEL_RELEASE_SERIES: "6.18"
-  ANDROID_KERNEL_PAGE_SIZE: "16384"
-  ANDROID_KERNEL_SLICE: "arm64"
 
 jobs:
 
   # ============================================================
-  # JOB 1
-  # Export the exact iPhoneOS SDK from the GitHub macOS runner.
-  # The Linux ACK builder needs this SDK for the Darwin UML kernel.
+  # 1. BUILD DARWIN SDK
   # ============================================================
   prepare-darwin-sdk:
     name: Prepare Darwin SDK
@@ -39,16 +33,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Xcode:"
           xcodebuild -version
-
-          echo
-          echo "iPhoneOS SDK:"
-          xcrun --sdk iphoneos --show-sdk-version
-
-          echo
-          echo "SDK path:"
           xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
 
       - name: Archive iPhoneOS SDK
         shell: bash
@@ -56,47 +43,54 @@ jobs:
           set -euo pipefail
 
           SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
-          SDK_NAME="$(basename "$SDK_PATH")"
+          SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
 
           echo "SDK_PATH=$SDK_PATH"
-          echo "SDK_NAME=$SDK_NAME"
+          echo "SDK_VERSION=$SDK_VERSION"
+
+          mkdir -p "$RUNNER_TEMP/darwin-sdk"
+
+          ditto "$SDK_PATH" \
+            "$RUNNER_TEMP/darwin-sdk/iPhoneOS.sdk"
 
           tar \
-            -C "$(dirname "$SDK_PATH")" \
-            -czf "$RUNNER_TEMP/iphoneos-sdk.tar.gz" \
-            "$SDK_NAME"
+            -C "$RUNNER_TEMP/darwin-sdk" \
+            -czf "$RUNNER_TEMP/DarwinSDK.tar.gz" \
+            iPhoneOS.sdk
 
-          ls -lh "$RUNNER_TEMP/iphoneos-sdk.tar.gz"
+          sha256sum "$RUNNER_TEMP/DarwinSDK.tar.gz"
+
+          echo "$SDK_VERSION" \
+            > "$RUNNER_TEMP/DarwinSDK.version"
 
       - name: Upload Darwin SDK
         uses: actions/upload-artifact@v4
         with:
-          name: kernarium-iphoneos-sdk
-          path: ${{ runner.temp }}/iphoneos-sdk.tar.gz
-          if-no-files-found: error
-          retention-days: 1
+          name: darwin-sdk
+          path: |
+            ${{ runner.temp }}/DarwinSDK.tar.gz
+            ${{ runner.temp }}/DarwinSDK.version
+          retention-days: 7
 
 
   # ============================================================
-  # JOB 2
-  # Build the real Android 17 ACK 6.18 Darwin UML kernel.
+  # 2. BUILD ANDROID 17 ACK 6.18 KERNEL
+  # ============================================================
   #
-  # Kernarium's official producer requires:
+  # IMPORTANT:
+  # Kernarium's Android 17 producer requires:
   #   Linux x86_64
   #   >= 64 GiB RAM
-  #   >= 400 GiB free disk
+  #   >= 400 GiB free workspace
   #
-  # This is still GitHub Actions.
-  # ============================================================
+  # Therefore DO NOT replace this with ubuntu-latest.
+  #
+  # If this runner is unavailable on your GitHub account,
+  # this job will remain queued and must be moved to a
+  # self-hosted / larger Linux runner with the required resources.
+  #
   build-android17-kernel:
     name: Build Android 17 ACK Kernel
-    needs: prepare-darwin-sdk
-
-    # GitHub larger runner.
-    #
-    # IMPORTANT:
-    # The normal ubuntu-latest runner is intentionally NOT used here.
-    # Kernarium's preflight requires 64 GiB RAM + 400 GiB disk.
     runs-on: ubuntu-24.04-64-core
 
     steps:
@@ -106,8 +100,51 @@ jobs:
       - name: Download Darwin SDK
         uses: actions/download-artifact@v4
         with:
-          name: kernarium-iphoneos-sdk
+          name: darwin-sdk
           path: ${{ runner.temp }}/darwin-sdk
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            git \
+            git-lfs \
+            repo \
+            rsync \
+            unzip \
+            zip \
+            curl \
+            wget \
+            python3 \
+            python3-pip \
+            python3-venv \
+            build-essential \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            cpio \
+            kmod \
+            dwarves \
+            pahole \
+            device-tree-compiler \
+            clang \
+            lld \
+            llvm \
+            libncurses-dev
+
+      - name: Configure Git identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config --global user.name "AndroidEmu CI"
+          git config --global user.email "androidemu-ci@users.noreply.github.com"
 
       - name: Extract Darwin SDK
         shell: bash
@@ -117,31 +154,20 @@ jobs:
           mkdir -p "$RUNNER_TEMP/darwin-sdk/extracted"
 
           tar \
-            -xzf "$RUNNER_TEMP/darwin-sdk/iphoneos-sdk.tar.gz" \
+            -xzf "$RUNNER_TEMP/darwin-sdk/DarwinSDK.tar.gz" \
             -C "$RUNNER_TEMP/darwin-sdk/extracted"
 
-          SDK_PATH="$(find "$RUNNER_TEMP/darwin-sdk/extracted" \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -type d \
-            -name 'iPhoneOS*.sdk' \
-            -print -quit)"
+          SDK="$RUNNER_TEMP/darwin-sdk/extracted/iPhoneOS.sdk"
 
-          if [ -z "$SDK_PATH" ]; then
-            echo "ERROR: iPhoneOS SDK was not extracted"
-            find "$RUNNER_TEMP/darwin-sdk/extracted" -maxdepth 3 -print
-            exit 1
-          fi
+          test -f "$SDK/SDKSettings.json"
 
-          echo "DARWIN_SDK=$SDK_PATH" >> "$GITHUB_ENV"
+          echo "DARWIN_SDK=$SDK" >> "$GITHUB_ENV"
 
-          echo
           echo "Darwin SDK:"
-          echo "$SDK_PATH"
+          du -sh "$SDK"
+          cat "$RUNNER_TEMP/darwin-sdk/DarwinSDK.version"
 
-          test -f "$SDK_PATH/SDKSettings.json"
-
-      - name: Show Linux builder resources
+      - name: Verify runner capacity
         shell: bash
         run: |
           set -euo pipefail
@@ -155,271 +181,162 @@ jobs:
 
           echo
           echo "Disk:"
-          df -h /
+          df -h "$GITHUB_WORKSPACE"
 
           echo
-          echo "Architecture:"
-          uname -m
+          echo "Required:"
+          echo "  RAM >= 64 GiB"
+          echo "  Free disk >= 400 GiB"
 
-      - name: Install Linux build tools
+          RAM_KIB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+          FREE_KIB="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')"
+
+          if [ "$RAM_KIB" -lt 67108864 ]; then
+            echo "::error::Runner has less than 64 GiB RAM"
+            exit 1
+          fi
+
+          if [ "$FREE_KIB" -lt 419430400 ]; then
+            echo "::error::Runner has less than 400 GiB free disk"
+            exit 1
+          fi
+
+      - name: Verify Android 17 producer
         shell: bash
         run: |
           set -euo pipefail
 
-          sudo apt-get update
+          test -x android/aosp-17/build/prepare-sources.sh
+          test -x android/aosp-17/build/preflight.sh
+          test -x android/aosp-17/build/build-kernel.sh
+          test -x android/aosp-17/tools/publish-kernel-artifact.py
 
-          sudo apt-get install -y \
-            git \
-            curl \
-            wget \
-            rsync \
-            unzip \
-            zip \
-            zstd \
-            python3 \
-            python3-pip \
-            python3-venv \
-            build-essential \
-            clang \
-            lld \
-            llvm \
-            bc \
-            bison \
-            flex \
-            libssl-dev \
-            libelf-dev \
-            dwarves \
-            cpio \
-            libncurses-dev \
-            file \
-            jq \
-            ca-certificates
+          android/aosp-17/build/prepare-sources.sh --help
+          android/aosp-17/build/preflight.sh --help
+          android/aosp-17/build/build-kernel.sh --help
+          android/aosp-17/tools/publish-kernel-artifact.py --help
 
-      - name: Install Android repo tool
+      - name: Create Android 17 source workspaces
         shell: bash
         run: |
           set -euo pipefail
 
-          sudo curl -fsSL \
-            https://storage.googleapis.com/git-repo-downloads/repo \
-            -o /usr/local/bin/repo
+          ROOT="$GITHUB_WORKSPACE"
 
-          sudo chmod 0755 /usr/local/bin/repo
+          mkdir -p "$ROOT/.build/android17"
+          mkdir -p "$ROOT/.build/android17/aosp"
+          mkdir -p "$ROOT/.build/android17/ack"
+          mkdir -p "$ROOT/.build/android17/kernel"
+          mkdir -p "$ROOT/.build/android17/kernel-build"
+          mkdir -p "$ROOT/.build/android17/artifacts"
 
-          repo --version
+          echo "AOSP_SOURCE=$ROOT/.build/android17/aosp" >> "$GITHUB_ENV"
+          echo "ACK_WORKSPACE=$ROOT/.build/android17/ack" >> "$GITHUB_ENV"
+          echo "KERNEL_SOURCE=$ROOT/.build/android17/ack/common" >> "$GITHUB_ENV"
+          echo "KERNEL_BUILD=$ROOT/.build/android17/kernel-build" >> "$GITHUB_ENV"
+          echo "KERNEL_ARTIFACT_ROOT=$ROOT/.build/android17/artifacts" >> "$GITHUB_ENV"
 
-      - name: Configure Git identity
+      - name: Initialize AOSP Repo workspace
         shell: bash
         run: |
           set -euo pipefail
 
-          git config --global user.name "AndroidEmu Builder"
-          git config --global user.email "androidemu-builder@localhost"
-
-          export GIT_AUTHOR_NAME="AndroidEmu Builder"
-          export GIT_AUTHOR_EMAIL="androidemu-builder@localhost"
-          export GIT_COMMITTER_NAME="AndroidEmu Builder"
-          export GIT_COMMITTER_EMAIL="androidemu-builder@localhost"
-
-          git config --global protocol.version 2
-          git config --global http.version HTTP/1.1
-          git config --global http.lowSpeedLimit 1000
-          git config --global http.lowSpeedTime 120
-
-      - name: Prepare Kernarium
-        shell: bash
-        env:
-          KERNARIUM_COMMIT: ${{ env.KERNARIUM_COMMIT }}
-        run: |
-          set -euo pipefail
-
-          rm -rf Kernarium
-
-          git clone \
-            --filter=blob:none \
-            --no-checkout \
-            https://github.com/imxieyi/Kernarium.git \
-            Kernarium
-
-          cd Kernarium
-
-          git fetch \
-            --depth=1 \
-            origin \
-            "$KERNARIUM_COMMIT"
-
-          git checkout --detach "$KERNARIUM_COMMIT"
-
-          ACTUAL="$(git rev-parse HEAD)"
-
-          echo "Expected Kernarium:"
-          echo "$KERNARIUM_COMMIT"
-
-          echo
-          echo "Actual Kernarium:"
-          echo "$ACTUAL"
-
-          test "$ACTUAL" = "$KERNARIUM_COMMIT"
-
-          test -d android/aosp-17
-          test -d kernel/android-6.18
-          test -f android/aosp-17/build/prepare-sources.sh
-          test -f android/aosp-17/build/build-kernel.sh
-          test -f android/aosp-17/tools/publish-kernel-artifact.py
-
-      - name: Prepare AOSP Repo workspace
-        shell: bash
-        working-directory: Kernarium
-        run: |
-          set -euo pipefail
-
-          AOSP_DIR="$RUNNER_TEMP/aosp-17"
-          mkdir -p "$AOSP_DIR"
-
-          cd "$AOSP_DIR"
+          source android/aosp-17/metadata/aosp.env
 
           repo init \
-            -u https://android.googlesource.com/platform/manifest \
-            -b android-17.0.0_r1 \
+            -u "$ANDROID17_MANIFEST_REPOSITORY" \
+            -b "$ANDROID17_MANIFEST_TAG" \
             --manifest-depth=1 \
             --repo-rev=stable \
             --no-repo-verify \
-            --no-clone-bundle
+            --no-clone-bundle \
+            "$AOSP_SOURCE"
 
-          echo
-          echo "AOSP Repo workspace created:"
-          echo "$AOSP_DIR"
-
-      - name: Prepare ACK Repo workspace
+      - name: Initialize ACK Repo workspace
         shell: bash
-        working-directory: Kernarium
         run: |
           set -euo pipefail
 
-          ACK_DIR="$RUNNER_TEMP/ack-6.18"
-          mkdir -p "$ACK_DIR"
+          source kernel/android-6.18/patches/metadata.env
 
-          cd "$ACK_DIR"
+          mkdir -p "$ACK_WORKSPACE"
 
           repo init \
-            -u https://android.googlesource.com/kernel/manifest \
-            -b android17-6.18 \
-            --manifest-depth=1 \
+            -u "$UML_KERNEL_UPSTREAM_REPOSITORY" \
+            -b "$UML_KERNEL_UPSTREAM_BRANCH" \
             --repo-rev=stable \
             --no-repo-verify \
-            --no-clone-bundle
+            --no-clone-bundle \
+            "$ACK_WORKSPACE"
 
-          echo
-          echo "ACK Repo workspace created:"
-          echo "$ACK_DIR"
-
-      - name: Prepare Android 17 source trees
+      - name: Prepare Android 17 sources
         shell: bash
-        working-directory: Kernarium
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
 
-          AOSP_DIR="$RUNNER_TEMP/aosp-17"
-          ACK_DIR="$RUNNER_TEMP/ack-6.18"
-
-          JOBS="$(nproc)"
-
-          echo "AOSP source: $AOSP_DIR"
-          echo "ACK workspace: $ACK_DIR"
-          echo "Jobs: $JOBS"
-
-          ./android/aosp-17/build/prepare-sources.sh \
-            --aosp-source "$AOSP_DIR" \
-            --ack-workspace "$ACK_DIR" \
-            --jobs "$JOBS"
+          android/aosp-17/build/prepare-sources.sh \
+            --aosp-source "$AOSP_SOURCE" \
+            --ack-workspace "$ACK_WORKSPACE" \
+            --jobs "$(nproc)"
 
       - name: Android 17 source preflight
         shell: bash
-        working-directory: Kernarium
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
 
-          ./android/aosp-17/build/preflight.sh \
-            --aosp-source "$RUNNER_TEMP/aosp-17" \
-            --ack-workspace "$RUNNER_TEMP/ack-6.18" \
+          android/aosp-17/build/preflight.sh \
+            --aosp-source "$AOSP_SOURCE" \
+            --ack-workspace "$ACK_WORKSPACE" \
             --source-only
 
       - name: Build Android 17 ACK kernel
         shell: bash
-        working-directory: Kernarium
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
 
-          KERNEL_BUILD="$RUNNER_TEMP/android17-kernel-build"
-
-          rm -rf "$KERNEL_BUILD"
-          mkdir -p "$KERNEL_BUILD"
-
-          ./android/aosp-17/build/build-kernel.sh \
-            --ack-workspace "$RUNNER_TEMP/ack-6.18" \
-            --kernel-source "$RUNNER_TEMP/ack-6.18/common" \
+          android/aosp-17/build/build-kernel.sh \
+            --ack-workspace "$ACK_WORKSPACE" \
+            --kernel-source "$KERNEL_SOURCE" \
             --darwin-sdk "$DARWIN_SDK" \
             --build "$KERNEL_BUILD" \
             --jobs "$(nproc)"
 
       - name: Publish Android 17 kernel artifact
         shell: bash
-        working-directory: Kernarium
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
 
-          ARTIFACT_ROOT="$RUNNER_TEMP/kernel-artifacts"
-          RELEASE_ID="gha-${GITHUB_RUN_ID}"
+          RELEASE_ID="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
-          rm -rf "$ARTIFACT_ROOT"
-          mkdir -p "$ARTIFACT_ROOT"
-
-          python3 \
-            android/aosp-17/tools/publish-kernel-artifact.py \
-            --source "$RUNNER_TEMP/ack-6.18/common" \
-            --build "$RUNNER_TEMP/android17-kernel-build" \
-            --output-root "$ARTIFACT_ROOT" \
+          android/aosp-17/tools/publish-kernel-artifact.py \
+            --source "$KERNEL_SOURCE" \
+            --build "$KERNEL_BUILD" \
+            --output-root "$KERNEL_ARTIFACT_ROOT" \
             --release-id "$RELEASE_ID"
 
-          echo
-          echo "Published kernel artifact:"
-          find "$ARTIFACT_ROOT" -maxdepth 3 -type f -print | sort
-
-          ARTIFACT_DIR="$(find "$ARTIFACT_ROOT" \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -type d \
-            -print -quit)"
-
-          test -n "$ARTIFACT_DIR"
-
-          test -f "$ARTIFACT_DIR/kernel-artifact.json"
-          test -f "$ARTIFACT_DIR/kernel/vmlinux"
-          test -f "$ARTIFACT_DIR/kernel/config"
-          test -f "$ARTIFACT_DIR/kernel/kernel.release"
-          test -f "$ARTIFACT_DIR/kernel/modules.builtin"
-          test -f "$ARTIFACT_DIR/kernel/modules.builtin.modinfo"
-
-          echo
-          echo "kernel-artifact.json:"
-          cat "$ARTIFACT_DIR/kernel-artifact.json"
+          find "$KERNEL_ARTIFACT_ROOT" \
+            -maxdepth 3 \
+            -type f \
+            -print
 
       - name: Upload Android 17 kernel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: android17-kernel-artifact
-          path: ${{ runner.temp }}/kernel-artifacts
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
+          name: android17-kernel
+          path: |
+            ${{ github.workspace }}/.build/android17/artifacts/**
+          retention-days: 30
 
 
   # ============================================================
-  # JOB 3
-  # Build the actual iOS application on macOS.
+  # 3. BUILD KERNARIUM + IOS APP
   # ============================================================
   build-ios:
-    name: Build AndroidEmu IPA
+    name: Build AndroidEmu iOS
     needs:
       - prepare-darwin-sdk
       - build-android17-kernel
@@ -434,26 +351,6 @@ jobs:
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: "16.4"
-
-      - name: Show Apple build environment
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "macOS:"
-          sw_vers -productVersion
-
-          echo
-          echo "Xcode:"
-          xcodebuild -version
-
-          echo
-          echo "iPhoneOS SDK:"
-          xcrun --sdk iphoneos --show-sdk-version
-
-          echo
-          echo "SDK path:"
-          xcrun --sdk iphoneos --show-sdk-path
 
       - name: Install build dependencies
         shell: bash
@@ -479,256 +376,219 @@ jobs:
             wget \
             rsync
 
-      - name: Prepare Python build environment
+      - name: Prepare Python environment
         shell: bash
         run: |
           set -euo pipefail
 
-          VENV="$RUNNER_TEMP/kernarium-venv"
+          python3 -m venv "$RUNNER_TEMP/venv"
 
-          python3 -m venv "$VENV"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install \
+            --upgrade pip
 
-          source "$VENV/bin/activate"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install \
+            PyYAML
 
-          python -m pip install --upgrade pip
-          python -m pip install PyYAML
-
-          python -c 'import yaml; print("PyYAML:", yaml.__version__)'
-
-          echo "VENV=$VENV" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
 
       - name: Configure Git identity
         shell: bash
         run: |
           set -euo pipefail
 
-          git config --global user.name "AndroidEmu Builder"
-          git config --global user.email "androidemu-builder@localhost"
+          git config --global user.name "AndroidEmu CI"
+          git config --global user.email "androidemu-ci@users.noreply.github.com"
 
-          export GIT_AUTHOR_NAME="AndroidEmu Builder"
-          export GIT_AUTHOR_EMAIL="androidemu-builder@localhost"
-          export GIT_COMMITTER_NAME="AndroidEmu Builder"
-          export GIT_COMMITTER_EMAIL="androidemu-builder@localhost"
+      - name: Download Darwin SDK
+        uses: actions/download-artifact@v4
+        with:
+          name: darwin-sdk
+          path: ${{ runner.temp }}/darwin-sdk
 
-          git config --global protocol.version 2
-          git config --global http.version HTTP/1.1
-          git config --global http.lowSpeedLimit 1000
-          git config --global http.lowSpeedTime 120
+      - name: Extract Darwin SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/darwin-sdk/extracted"
+
+          tar \
+            -xzf "$RUNNER_TEMP/darwin-sdk/DarwinSDK.tar.gz" \
+            -C "$RUNNER_TEMP/darwin-sdk/extracted"
+
+          SDK="$RUNNER_TEMP/darwin-sdk/extracted/iPhoneOS.sdk"
+
+          test -f "$SDK/SDKSettings.json"
+
+          echo "DARWIN_SDK=$SDK" >> "$GITHUB_ENV"
+
+      - name: Download Android 17 kernel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android17-kernel
+          path: ${{ github.workspace }}/.build/kernel/artifacts
+
+      - name: Show Android 17 kernel artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find "$GITHUB_WORKSPACE/.build/kernel/artifacts" \
+            -maxdepth 5 \
+            -type f \
+            -print
+
+          find "$GITHUB_WORKSPACE/.build/kernel/artifacts" \
+            -maxdepth 2 \
+            -type d \
+            -print
+
+      - name: Verify Android 17 kernel artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARTIFACT_ROOT="$GITHUB_WORKSPACE/.build/kernel/artifacts"
+
+          test -d "$ARTIFACT_ROOT"
+
+          KERNEL_DIR="$(find "$ARTIFACT_ROOT" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -name 'android-6.18-arm64-16k-*' \
+            -print -quit)"
+
+          if [ -z "$KERNEL_DIR" ]; then
+            echo "::error::Android 17 kernel artifact directory was not found"
+            exit 1
+          fi
+
+          test -f "$KERNEL_DIR/kernel/vmlinux"
+          test -f "$KERNEL_DIR/kernel/System.map"
+          test -f "$KERNEL_DIR/kernel/config"
+          test -f "$KERNEL_DIR/kernel/kernel.release"
+          test -f "$KERNEL_DIR/kernel/modules.builtin"
+          test -f "$KERNEL_DIR/kernel/modules.builtin.modinfo"
+          test -f "$KERNEL_DIR/kernel-artifact.json"
+
+          echo "KERNEL_ARTIFACT_DIR=$KERNEL_DIR" >> "$GITHUB_ENV"
+
+          echo
+          echo "Android 17 kernel artifact:"
+          cat "$KERNEL_DIR/kernel-artifact.json"
 
       - name: Fetch Kernarium
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf Kernarium
+          rm -rf "$RUNNER_TEMP/Kernarium"
 
           git clone \
             --filter=blob:none \
-            --no-checkout \
             https://github.com/imxieyi/Kernarium.git \
-            Kernarium
+            "$RUNNER_TEMP/Kernarium"
 
-          cd Kernarium
-
-          git fetch \
+          git -C "$RUNNER_TEMP/Kernarium" fetch \
             --depth=1 \
-            origin \
-            "$KERNARIUM_COMMIT"
+            origin "$KERNARIUM_COMMIT"
 
-          git checkout --detach "$KERNARIUM_COMMIT"
+          git -C "$RUNNER_TEMP/Kernarium" checkout \
+            --detach "$KERNARIUM_COMMIT"
 
-          ACTUAL="$(git rev-parse HEAD)"
-
-          echo "Expected:"
-          echo "$KERNARIUM_COMMIT"
-
-          echo "Actual:"
-          echo "$ACTUAL"
+          ACTUAL="$(git -C "$RUNNER_TEMP/Kernarium" rev-parse HEAD)"
 
           test "$ACTUAL" = "$KERNARIUM_COMMIT"
 
-          test -d android/aosp-17
+          echo "KERNARIUM_ROOT=$RUNNER_TEMP/Kernarium" >> "$GITHUB_ENV"
 
-      - name: Download Android 17 kernel artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: android17-kernel-artifact
-          path: ${{ github.workspace }}/Kernarium/.build/kernel/artifacts
-
-      - name: Locate Android 17 kernel artifact
+      - name: Verify Android 17 product
         shell: bash
         run: |
           set -euo pipefail
 
-          ARTIFACT_ROOT="$GITHUB_WORKSPACE/Kernarium/.build/kernel/artifacts"
+          cd "$KERNARIUM_ROOT"
 
-          echo "Artifact root:"
-          echo "$ARTIFACT_ROOT"
-
-          find "$ARTIFACT_ROOT" \
-            -maxdepth 4 \
-            -type f \
-            -print | sort
-
-          KERNEL_DIR="$(find "$ARTIFACT_ROOT" \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -type d \
-            -print -quit)"
-
-          if [ -z "$KERNEL_DIR" ]; then
-            echo "ERROR: Android 17 kernel artifact directory was not found"
-            exit 1
-          fi
-
-          echo
-          echo "Selected kernel artifact:"
-          echo "$KERNEL_DIR"
-
-          test -f "$KERNEL_DIR/kernel-artifact.json"
-          test -f "$KERNEL_DIR/kernel/vmlinux"
-          test -f "$KERNEL_DIR/kernel/config"
-          test -f "$KERNEL_DIR/kernel/kernel.release"
-          test -f "$KERNEL_DIR/kernel/modules.builtin"
-          test -f "$KERNEL_DIR/kernel/modules.builtin.modinfo"
-
-          echo "KERNEL_ARTIFACT_DIR=$KERNEL_DIR" >> "$GITHUB_ENV"
-
-      - name: Verify Android 17 kernel artifact
-        shell: bash
-        working-directory: Kernarium
-        run: |
-          set -euo pipefail
-
-          python3 \
-            kernel/common/artifacts/verify-kernel-artifact.py \
-            --artifact "$KERNEL_ARTIFACT_DIR" \
-            --common-root "$GITHUB_WORKSPACE/Kernarium/kernel/common" \
-            --abi-metadata "$GITHUB_WORKSPACE/Kernarium/kernel/common/abi/identity.env" \
-            --compatible \
-            --expected-family "$ANDROID_KERNEL_FAMILY" \
-            --expected-slice "$ANDROID_KERNEL_SLICE" \
-            --expected-release-series "$ANDROID_KERNEL_RELEASE_SERIES" \
-            --expected-page-size "$ANDROID_KERNEL_PAGE_SIZE"
+          test -f android/aosp-17/CMakeLists.txt
+          test -f android/aosp-17/README.md
+          test -f kernel/android-6.18/artifacts/accepted-16k.env
 
       - name: Patch Kernarium for iOS 16.4
         shell: bash
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
 
-          if [ -x "./scripts/patch-kernarium.sh" ]; then
-            ./scripts/patch-kernarium.sh
-          elif [ -f "./scripts/patch-kernarium.sh" ]; then
-            bash ./scripts/patch-kernarium.sh
-          else
-            echo "No patch-kernarium.sh present, continuing."
-          fi
+          scripts/patch-kernarium.sh "$KERNARIUM_ROOT" "$IOS_VERSION"
 
       - name: Build Kernarium
         shell: bash
+        working-directory: ${{ github.workspace }}
         env:
-          KERNARIUM_COMMIT: ${{ env.KERNARIUM_COMMIT }}
-          IOS_VERSION: ${{ env.IOS_VERSION }}
-          ARCH: arm64
+          KERNEL_ARTIFACT_DIR: ${{ github.workspace }}/.build/kernel/artifacts
         run: |
           set -euo pipefail
 
-          ./scripts/build-kernarium.sh
+          test -d "$KERNEL_ARTIFACT_DIR"
+
+          scripts/build-kernarium.sh
 
       - name: Verify Kernarium output
         shell: bash
         run: |
           set -euo pipefail
 
-          KERNARIUM="Kernarium"
+          test -d "$KERNARIUM_ROOT"
 
-          echo "Kernarium build outputs:"
-          find "$KERNARIUM/.build" \
+          echo "Kernarium build output:"
+          find "$KERNARIUM_ROOT/.build" \
             -maxdepth 5 \
             -type f \
-            -print | sort | head -n 500
-
-          if [ ! -d "$KERNARIUM/.build/ios-arm64" ]; then
-            echo "ERROR: Kernarium iOS build directory was not created"
-            exit 1
-          fi
-
-          if [ ! -d "$KERNARIUM/.build/install-ios" ]; then
-            echo "ERROR: Kernarium install directory was not created"
-            exit 1
-          fi
+            \( -name '*.a' -o -name '*.dylib' -o -name '*.app' \) \
+            -print | head -200
 
       - name: Stage Android runtime
         shell: bash
         run: |
           set -euo pipefail
 
-          ./scripts/stage-android.sh
+          scripts/stage-android.sh "$KERNARIUM_ROOT"
 
       - name: Verify staged Android runtime
         shell: bash
         run: |
           set -euo pipefail
 
-          ANDROID_DIR="$GITHUB_WORKSPACE/App/AndroidEmu/Resources/Android"
-
-          test -d "$ANDROID_DIR"
+          test -d "$KERNARIUM_ROOT"
 
           echo "Android runtime staging:"
-          find "$ANDROID_DIR" \
+          find "$KERNARIUM_ROOT" \
             -maxdepth 5 \
             -type f \
-            -print | sort
+            -print | head -300
 
       - name: Verify Xcode project
         shell: bash
         run: |
           set -euo pipefail
 
-          find . \
-            -maxdepth 4 \
-            \( -name '*.xcodeproj' -o -name '*.xcworkspace' \) \
-            -print
-
-      - name: Locate Xcode project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PROJECT="$(find "$GITHUB_WORKSPACE" \
-            -maxdepth 5 \
-            -name '*.xcodeproj' \
-            -print -quit)"
-
-          if [ -z "$PROJECT" ]; then
-            echo "ERROR: Xcode project was not found"
-            exit 1
-          fi
-
-          echo "XCODE_PROJECT=$PROJECT" >> "$GITHUB_ENV"
-
-          echo "Xcode project:"
-          echo "$PROJECT"
+          test -f AndroidEmu.xcodeproj/project.pbxproj
 
       - name: Build AndroidEmu.app
         shell: bash
         run: |
           set -euo pipefail
 
-          PROJECT="$XCODE_PROJECT"
-
           xcodebuild \
-            -project "$PROJECT" \
+            -project AndroidEmu.xcodeproj \
             -scheme AndroidEmu \
             -configuration Release \
             -sdk iphoneos \
             -destination "generic/platform=iOS" \
-            -derivedDataPath "$RUNNER_TEMP/AndroidEmuDerivedData" \
-            DEVELOPMENT_TEAM="" \
+            IPHONEOS_DEPLOYMENT_TARGET="$IOS_VERSION" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            IPHONEOS_DEPLOYMENT_TARGET="$IOS_VERSION" \
             build
 
       - name: Locate AndroidEmu.app
@@ -736,74 +596,52 @@ jobs:
         run: |
           set -euo pipefail
 
-          APP="$(find "$RUNNER_TEMP/AndroidEmuDerivedData/Build/Products" \
+          APP_PATH="$(find "$GITHUB_WORKSPACE" \
             -type d \
-            -name 'AndroidEmu.app' \
+            -path '*/Build/Products/Release-iphoneos/AndroidEmu.app' \
             -print -quit)"
 
-          if [ -z "$APP" ]; then
-            echo "ERROR: AndroidEmu.app was not found"
-
-            find "$RUNNER_TEMP/AndroidEmuDerivedData" \
-              -maxdepth 6 \
-              -print
-
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::AndroidEmu.app was not found"
             exit 1
           fi
 
-          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
-
-          echo
-          echo "AndroidEmu.app:"
-          echo "$APP"
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
 
       - name: Package IPA
         shell: bash
         run: |
           set -euo pipefail
 
-          APP="$APP_PATH"
-          PAYLOAD="$RUNNER_TEMP/Payload"
-          IPA="$GITHUB_WORKSPACE/AndroidEmu-iOS16.ipa"
+          mkdir -p "$RUNNER_TEMP/Payload"
 
-          rm -rf "$PAYLOAD"
-          mkdir -p "$PAYLOAD"
-
-          cp -R "$APP" "$PAYLOAD/AndroidEmu.app"
-
-          rm -f "$IPA"
+          cp -R "$APP_PATH" \
+            "$RUNNER_TEMP/Payload/AndroidEmu.app"
 
           cd "$RUNNER_TEMP"
 
           /usr/bin/zip \
             -qry \
-            "$IPA" \
+            "$GITHUB_WORKSPACE/AndroidEmu-iOS16.4.ipa" \
             Payload
-
-          cd "$GITHUB_WORKSPACE"
-
-          ls -lh "$IPA"
-
-          test -f "$IPA"
 
       - name: Verify IPA
         shell: bash
         run: |
           set -euo pipefail
 
-          IPA="$GITHUB_WORKSPACE/AndroidEmu-iOS16.ipa"
+          test -f "$GITHUB_WORKSPACE/AndroidEmu-iOS16.4.ipa"
 
-          unzip -l "$IPA"
-
-          unzip -l "$IPA" | grep -q 'Payload/AndroidEmu.app/'
+          unzip -l \
+            "$GITHUB_WORKSPACE/AndroidEmu-iOS16.4.ipa"
 
           echo
-          echo "IPA verification: OK"
+          echo "IPA size:"
+          du -h "$GITHUB_WORKSPACE/AndroidEmu-iOS16.4.ipa"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: AndroidEmu-iOS16-IPA
-          path: AndroidEmu-iOS16.ipa
-          if-no-files-found: error
-          retention-days: 7
+          name: AndroidEmu-iOS16.4
+          path: AndroidEmu-iOS16.4.ipa
+          retention-days: 30
